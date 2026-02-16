@@ -2,6 +2,8 @@
 
 *Velocity through executable clarity*
 
+Forked from allium (<https://github.com/juxt/allium>) as their templates were REALLY good! Then modified it to use Recife (<https://github.com/pfeodrippe/recife>).
+
 ---
 
 A Clojure model checking workflow for sharpening intent alongside implementation.
