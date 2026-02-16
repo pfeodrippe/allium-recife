@@ -1810,3 +1810,159 @@ Avoid:
 - adding unbounded collections without safety checks
 - using implicit status transitions not represented in process code
 - keeping pattern names when your domain uses different terms
+
+## 1. Map Destructuring in Functions
+
+**Error:**
+```
+ClassCastException: class clojure.lang.PersistentHashMap cannot be cast to class java.util.Map$Entry
+```
+
+**Cause:** Using `(fn [[k v]] ...)` destructuring on maps, or `for [[k v] some-map]`
+
+**Fix:** Use `reduce-kv` instead:
+```clojure
+;; Bad
+(every? (fn [[k v]] (pos? v)) some-map)
+(for [[k v] some-map] ...)
+
+;; Good
+(reduce-kv (fn [ok? k v] (and ok? (pos? v))) true some-map)
+```
+
+## 2. Using `vals` or `keys` on Maps
+
+**Error:** Same `ClassCastException` as above
+
+**Cause:** Calling `(vals some-map)` or `(keys some-map)` on state maps
+
+**Fix:** Use `reduce-kv`:
+```clojure
+;; Bad
+(reduce + 0 (map :amount (vals transfers)))
+
+;; Good
+(reduce-kv (fn [acc _id transfer] (+ acc (:amount transfer))) 0 transfers)
+```
+
+## 3. Using `nil` Values in State
+
+**Error:** TLC may fail silently or produce unexpected behavior
+
+**Cause:** `nil` doesn't translate well to TLA+
+
+**Fix:** Use sentinel keywords like `:none`, `:unset`, or `0`:
+```clojure
+;; Bad
+{:repaired-at nil}
+
+;; Good
+{:repaired-at :none}
+```
+
+## 4. Using Strings in State
+
+**Error:** May cause serialization issues
+
+**Cause:** Strings don't work well with TLC
+
+**Fix:** Use keywords instead:
+```clojure
+;; Bad
+{:checksum "abc123"}
+
+;; Good
+{:checksum :abc123}
+```
+
+## 5. `case` with Keyword Sets
+
+**Error:** Runtime errors or unexpected matching behavior
+
+**Cause:** `case` doesn't work reliably with keyword set membership
+
+**Fix:** Use `cond` with `contains?`:
+```clojure
+;; Bad
+(case status
+  #{:pending :active} :running
+  :done)
+
+;; Good
+(cond
+  (contains? #{:pending :active} status) :running
+  :else :done)
+```
+
+## 6. Unbalanced Initial State Violates Invariants
+
+**Error:** Model fails immediately with invariant violation trace
+
+**Cause:** Initial `global` state doesn't satisfy invariants (e.g., debits ≠ credits)
+
+**Fix:** Ensure initial state satisfies all invariants:
+```clojure
+;; Bad - unbalanced
+{:accounts {1 {:credits-posted 100}
+            2 {:debits-posted 50}}}
+
+;; Good - balanced
+{:accounts {1 {:credits-posted 0 :debits-posted 0}
+            2 {:credits-posted 0 :debits-posted 0}}}
+```
+
+## 7. Deterministic Scenarios Explore Few States
+
+**Error:** Not an error, but only ~10-50 states explored
+
+**Cause:** Processing fixed queues in deterministic order
+
+**Fix:** Use `r/one-of` to introduce nondeterminism:
+```clojure
+;; Deterministic - few states
+{:amount 50 :mode :pending}
+
+;; Nondeterministic - many states
+{:amount (r/one-of #{10 50 100})
+ :mode (r/one-of #{:single-phase :pending})}
+```
+
+## 8. Variable Shadowing in Invariants
+
+**Error:** Confusing behavior or errors when accessing state
+
+**Cause:** Using same name for destructured binding and local variable
+
+**Fix:** Use distinct names:
+```clojure
+;; Bad
+(rh/definvariant foo
+  [{:keys [::accounts]}]
+  (let [accounts (vals accounts)] ...))  ;; shadows
+
+;; Good
+(rh/definvariant foo
+  [{:keys [::accounts]}]
+  (reduce-kv (fn [acc _id account] ...) 0 accounts))
+```
+
+## 9. Long-Running Model Checks
+
+**Cause:** State space explosion from too many `r/one-of` combinations
+
+**Fix:**
+- Reduce the number of nondeterministic choices
+- Limit `clock-max` or queue depths
+- Use smaller sets in `r/one-of`
+- Use fewer workers initially to debug
+
+## Quick Reference: Safe Patterns
+
+| Unsafe Pattern | Safe Alternative |
+|----------------|------------------|
+| `(fn [[k v]] ...)` on map | `reduce-kv` |
+| `(vals m)` / `(keys m)` | `reduce-kv` |
+| `nil` in state | `:none` or `0` |
+| `"string"` in state | `:keyword` |
+| `case` with sets | `cond` + `contains?` |
+| Fixed queue scenarios | `r/one-of` for nondeterminism |
