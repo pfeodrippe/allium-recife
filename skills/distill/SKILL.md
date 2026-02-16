@@ -1,11 +1,11 @@
 ---
 name: distill
-description: This skill should be used when the user has "existing code" and wants to "extract a spec", "distil behaviour from code", "reverse engineer a specification", or wants to produce an Allium specification from an existing codebase.
+description: This skill should be used when the user has "existing code" and wants to "extract a model", "distill behaviour from code", "reverse engineer a specification", or wants to produce a Recife model from an existing codebase.
 ---
 
 # Distillation guide
 
-This guide covers extracting Allium specifications from existing codebases. The core challenge is the same as forward elicitation: finding the right level of abstraction. In elicitation you filter out implementation ideas as they arise. In distillation you filter out implementation details that already exist. Both require the same judgement about what matters at the domain level.
+This guide covers extracting Recife specifications from existing codebases. The core challenge is the same as forward elicitation: finding the right level of abstraction. In elicitation you filter out implementation ideas as they arise. In distillation you filter out implementation details that already exist. Both require the same judgement about what matters at the domain level.
 
 Code tells you *how* something works. A specification captures *what* it does and *why* it matters. The skill is asking "why does the stakeholder care about this?" and "could this be different while still being the same system?"
 
@@ -38,22 +38,23 @@ For any code path you encounter, ask: "If we rebuilt this system from scratch, w
 
 ### Documenting scope decisions
 
-At the top of a distilled spec, document what is included and excluded:
+At the top of a distilled model file, document what is included and excluded:
 
+```clojure
+(ns interview-scheduling.model
+  (:require [recife.core :as r]
+            [recife.helpers :as rh]))
+
+;; Scope: Interview scheduling flow only
+;; Includes: candidacy, interview, interview-slot, invitation, feedback
+;; Excludes:
+;;   - user authentication (use auth model)
+;;   - analytics/reporting (separate model)
+;;   - legacy v1 api (deprecated, not specified)
+;;   - greenhouse sync (use greenhouse model)
 ```
--- allium: 1
--- interview-scheduling.allium
 
--- Scope: Interview scheduling flow only
--- Includes: Candidacy, Interview, InterviewSlot, Invitation, Feedback
--- Excludes:
---   - User authentication (use auth library spec)
---   - Analytics/reporting (separate spec)
---   - Legacy V1 API (deprecated, not specified)
---   - Greenhouse sync (use greenhouse library spec)
-```
-
-The version marker (`-- allium: N`) must be the first line of every `.allium` file. Use the version number from the root Allium skill's `version` frontmatter field.
+Use a namespace declaration as the first form in every Recife `.clj` model file, then capture scope notes as comments near the top.
 
 ## Finding the right level of abstraction
 
@@ -139,36 +140,40 @@ def send_invitation(candidate_id: int, slot_ids: List[int]) -> Invitation:
     return invitation
 ```
 
-```
--- Specification should say:
-rule SendInvitation {
-    when: SendInvitation(candidacy, slots)
-
-    requires: slots.all(s => s.status = confirmed)
-
-    ensures:
-        for s in slots:
-            s.status = proposed
-    ensures: Invitation.created(
-        candidacy: candidacy,
-        slots: slots,
-        expires_at: now + 7.days,
-        status: pending
-    )
-    ensures: Email.created(
-        to: candidacy.candidate.email,
-        template: interview_invitation
-    )
-}
+```clojure
+;; Model should say:
+(r/defproc send-invitation
+  (fn [{:keys [::candidacies ::slots ::config :mail/outbox :commands/send-invitation] :as db}]
+    (when-let [{:keys [candidacy-id slot-ids]} (first send-invitation)]
+      (let [candidacy (get candidacies candidacy-id)
+            selected-slots (select-keys slots slot-ids)]
+        (when (every? (fn [[_ slot]] (= :confirmed (:status slot))) selected-slots)
+          (let [invitation-id (keyword (str "inv-" (inc (count (::invitations db)))))
+                expires-at (+ (:clock/now db) (:invitation-expiry-ms config))
+                db' (-> db
+                        (update :commands/send-invitation disj {:candidacy-id candidacy-id :slot-ids slot-ids})
+                        (assoc-in [::invitations invitation-id]
+                                  {:candidacy-id candidacy-id
+                                   :slot-ids slot-ids
+                                   :expires-at expires-at
+                                   :status :pending}))
+                db'' (reduce (fn [acc [slot-id _]]
+                               (assoc-in acc [::slots slot-id :status] :proposed))
+                             db'
+                             selected-slots)]
+            (update db'' :mail/outbox conj
+                    {:to (get-in candidacy [:candidate :email])
+                     :template :interview-invitation
+                     :invitation-id invitation-id})))))))
 ```
 
 What we dropped:
-- `candidate_id: int` became just `candidacy`
-- `db.session.query(...)` became relationship traversal
-- `secrets.token_urlsafe(32)` removed entirely (token is implementation)
-- `datetime.utcnow() + timedelta(...)` became `now + 7.days`
-- `db.session.add/commit` implied by `created`
-- `invitation.slots.append(slot)` implied by relationship
+- `candidate_id: int` became a model-level `candidacy-id`
+- `db.session.query(...)` became map/set lookups in model state
+- `secrets.token_urlsafe(32)` removed entirely (token generation is implementation)
+- `datetime.utcnow() + timedelta(...)` became model time arithmetic (`:clock/now` + config)
+- `db.session.add/commit` became explicit state transition in one process step
+- `invitation.slots.append(slot)` became slot-id membership/state updates
 
 ### Ask "Would a product owner care?"
 
@@ -188,12 +193,12 @@ For every detail in the code, ask:
 **Means:** how the code achieves something.
 **Ends:** what outcome the system needs.
 
-| Means (code) | Ends (spec) |
+| Means (code) | Ends (model) |
 |--------------|-------------|
-| `requests.post('https://slack.com/api/...')` | `Notification.created(channel: slack)` |
-| `candidate.oauth_token = google.exchange(code)` | `Candidate authenticated` |
-| `redis.setex(f'session:{id}', 86400, data)` | `Session.created(expires: 24.hours)` |
-| `for slot in slots: slot.status = 'cancelled'` | `for s in slots: s.status = cancelled` |
+| `requests.post('https://slack.com/api/...')` | `(update db :notifications/outbox conj {:channel :slack ...})` |
+| `candidate.oauth_token = google.exchange(code)` | `candidate state transitions to :authenticated` |
+| `redis.setex(f'session:{id}', 86400, data)` | `(assoc-in db [::sessions sid :expires-at] (+ now 86400000))` |
+| `for slot in slots: slot.status = 'cancelled'` | `(reduce (fn [acc sid] (assoc-in acc [::slots sid :status] :cancelled)) db slot-ids)` |
 
 ## The concrete detail problem
 
@@ -238,12 +243,12 @@ class Candidate(Base):
     metadata = Column(JSONB)
 ```
 
-**Almost always implementation.** The spec should say:
-```
-entity Candidate {
-    skills: Set<String>
-    metadata: String?              -- or model specific fields
-}
+**Almost always implementation.** The model should say:
+```clojure
+(def global
+  {::candidates
+   {:candidate-1 {:skills #{\"clojure\" \"tla+\"}
+                  :metadata nil}}})
 ```
 
 The specific database is rarely domain-level. Exception: if the system explicitly promises PostgreSQL compatibility or specific PostgreSQL features to users.
@@ -270,13 +275,14 @@ class GreenhouseSync:
 - Could be swapped for Lever, Workable, etc.
 - The integration is an implementation detail of "candidates are imported"
 
-Spec:
-```
-external entity Candidate {
-    name: String
-    email: String
-    source: CandidateSource
-}
+Model:
+```clojure
+(def global
+  {::candidates {}
+   :greenhouse/inbound #{}})
+
+;; Candidate source is tracked as a plain field in model state.
+;; e.g. {:name \"Ana\" :email \"ana@example.com\" :source :greenhouse}
 ```
 
 **Product-level if:**
@@ -284,21 +290,17 @@ external entity Candidate {
 - Users configure their Greenhouse connection
 - Greenhouse-specific features are exposed (like syncing feedback back)
 
-Spec:
-```
-external entity Candidate {
-    name: String
-    email: String
-    greenhouse_id: String?  -- explicitly modeled
-}
-
-rule SyncFromGreenhouse {
-    when: GreenhouseWebhookReceived(candidate_data)
-    ensures: Candidate.created(
-        ...
-        greenhouse_id: candidate_data.id
-    )
-}
+Model:
+```clojure
+(r/defproc sync-from-greenhouse
+  (fn [{:keys [:greenhouse/inbound] :as db}]
+    (when-let [candidate-data (first inbound)]
+      (-> db
+          (update :greenhouse/inbound disj candidate-data)
+          (assoc-in [::candidates (keyword (:id candidate-data))]
+                    {:name (:name candidate-data)
+                     :email (:email candidate-data)
+                     :greenhouse-id (:id candidate-data)})))))
 ```
 
 ### The "Multiple implementations" heuristic
@@ -350,10 +352,13 @@ class Invitation(Base):
 ```
 
 Becomes:
-```
-entity Invitation {
-    status: pending | accepted | declined | expired
-}
+```clojure
+(def global
+  {::invitations
+   {:inv-1 {:status :pending}
+    :inv-2 {:status :accepted}
+    :inv-3 {:status :declined}
+    :inv-4 {:status :expired}}})
 ```
 
 Look for enum definitions, status or state columns, constants like `STATUS_PENDING = 'pending'`, and state machine libraries (e.g. `transitions`, `django-fsm`).
@@ -395,40 +400,48 @@ def accept_invitation(invitation_id: int, slot_id: int):
 ```
 
 Extract:
-```
-rule CandidateAcceptsInvitation {
-    when: CandidateAccepts(invitation, slot)
-
-    requires: invitation.status = pending
-    requires: invitation.expires_at > now
-    requires: slot in invitation.slots
-
-    ensures: invitation.status = accepted
-    ensures: slot.status = booked
-    ensures:
-        for s in invitation.slots:
-            if s != slot: s.status = available
-    ensures: Interview.created(
-        candidacy: invitation.candidacy,
-        slot: slot,
-        status: scheduled
-    )
-    ensures: Notification.created(to: slot.interviewers, ...)
-    ensures: Email.created(to: invitation.candidate.email, ...)
-}
+```clojure
+(r/defproc candidate-accepts-invitation
+  (fn [{:keys [::invitations ::slots ::interviews :notifications/outbox :mail/outbox
+               :commands/candidate-accepts :clock/now] :as db}]
+    (when-let [{:keys [invitation-id slot-id]} (first candidate-accepts)]
+      (let [invitation (get invitations invitation-id)
+            slot (get slots slot-id)]
+        (when (and (= :pending (:status invitation))
+                   (> (:expires-at invitation) now)
+                   (contains? (set (:slot-ids invitation)) slot-id))
+          (let [other-slot-ids (disj (set (:slot-ids invitation)) slot-id)
+                db' (-> db
+                        (update :commands/candidate-accepts disj {:invitation-id invitation-id :slot-id slot-id})
+                        (assoc-in [::invitations invitation-id :status] :accepted)
+                        (assoc-in [::slots slot-id :status] :booked))
+                db'' (reduce (fn [acc sid]
+                               (assoc-in acc [::slots sid :status] :available))
+                             db'
+                             other-slot-ids)
+                interview-id (keyword (str "int-" (inc (count interviews))))]
+            (-> db''
+                (assoc-in [::interviews interview-id]
+                          {:candidacy-id (:candidacy-id invitation)
+                           :slot-id slot-id
+                           :status :scheduled})
+                (update :notifications/outbox conj {:to (:interviewer-ids slot)
+                                                    :kind :interview-scheduled})
+                (update :mail/outbox conj {:to (:candidate-email invitation)
+                                           :template :invitation-accepted}))))))))
 ```
 
 **Key extraction patterns:**
 
-| Code pattern | Spec pattern |
-|--------------|--------------|
-| `if x.status != 'pending': raise` | `requires: x.status = pending` |
-| `if x.expires_at < now: raise` | `requires: x.expires_at > now` |
-| `if item not in collection: raise` | `requires: item in collection` |
-| `x.status = 'accepted'` | `ensures: x.status = accepted` |
-| `Model.create(...)` | `ensures: Model.created(...)` |
-| `send_email(...)` | `ensures: Email.created(...)` |
-| `notify(...)` | `ensures: Notification.created(...)` |
+| Code pattern | Recife model pattern |
+|--------------|----------------------|
+| `if x.status != 'pending': raise` | guard `when (= :pending (:status x))` |
+| `if x.expires_at < now: raise` | guard `when (> (:expires-at x) now)` |
+| `if item not in collection: raise` | guard `when (contains? (set coll) item)` |
+| `x.status = 'accepted'` | `(assoc-in db [... :status] :accepted)` |
+| `Model.create(...)` | `(assoc-in db [::model id] {...})` |
+| `send_email(...)` | `(update db :mail/outbox conj {...})` |
+| `notify(...)` | `(update db :notifications/outbox conj {...})` |
 
 ### Step 4: Find temporal triggers
 
@@ -464,24 +477,31 @@ def send_reminders():
 ```
 
 Extract:
-```
-rule InvitationExpires {
-    when: invitation: Invitation.expires_at <= now
-    requires: invitation.status = pending
+```clojure
+(r/defproc invitation-expires
+  (fn [{:keys [::invitations ::slots :clock/now] :as db}]
+    (reduce-kv (fn [acc invitation-id invitation]
+                 (if (and (= :pending (:status invitation))
+                          (<= (:expires-at invitation) now))
+                   (let [acc' (assoc-in acc [::invitations invitation-id :status] :expired)]
+                     (reduce (fn [x sid] (assoc-in x [::slots sid :status] :available))
+                             acc'
+                             (:slot-ids invitation)))
+                   acc))
+               db
+               invitations)))
 
-    ensures: invitation.status = expired
-    ensures:
-        for s in invitation.slots:
-            s.status = available
-    ensures: CandidateInformed(candidate: invitation.candidate, about: invitation_expired)
-}
-
-rule InterviewReminder {
-    when: interview: Interview.slot.time - 1.hour <= now
-    requires: interview.status = scheduled
-
-    ensures: Notification.created(to: interview.interviewers, template: reminder)
-}
+(r/defproc interview-reminder
+  (fn [{:keys [::interviews :clock/now] :as db}]
+    (reduce-kv (fn [acc _ interview]
+                 (if (and (= :scheduled (:status interview))
+                          (<= (- (:slot-time interview) (* 60 60 1000)) now))
+                   (update acc :notifications/outbox conj
+                           {:to (:interviewer-ids interview)
+                            :template :reminder})
+                   acc))
+               db
+               interviews)))
 ```
 
 ### Step 5: Identify external boundaries
@@ -505,11 +525,11 @@ def import_from_greenhouse(webhook_data):
 ```
 
 Suggests:
-```
-external entity Candidate {
-    name: String
-    email: String
-}
+```clojure
+;; External boundary represented as inbound payloads.
+(def global
+  {:greenhouse/inbound #{}           ;; raw webhook events
+   ::candidates {}})                 ;; normalized domain projection
 ```
 
 ### Step 6: Abstract away implementation
@@ -517,33 +537,32 @@ external entity Candidate {
 Now make a pass through your extracted spec and remove implementation details.
 
 **Before (too concrete):**
-```
-entity Invitation {
-    candidate_id: Integer
-    token: String(32)
-    created_at: DateTime
-    expires_at: DateTime
-    status: pending | accepted | declined | expired
-}
+```clojure
+;; Too concrete: persistence/storage details leaking into the model.
+{:candidate-id 123
+ :token "K2m2zN6u..."
+ :created-at #inst "2026-02-10T10:00:00.000-00:00"
+ :expires-at #inst "2026-02-17T10:00:00.000-00:00"
+ :status :pending}
 ```
 
 **After (domain-level):**
-```
-entity Invitation {
-    candidacy: Candidacy
-    created_at: Timestamp
-    expires_at: Timestamp
-    status: pending | accepted | declined | expired
+```clojure
+{:candidacy-id :cand-42
+ :created-at 1739181600000
+ :expires-at 1739786400000
+ :status :pending}
 
-    is_expired: expires_at <= now
-}
+;; Derived check used by processes/properties:
+(defn expired? [invitation now]
+  (<= (:expires-at invitation) now))
 ```
 
 Changes:
-- `candidate_id: Integer` became `candidacy: Candidacy` (relationship, not FK)
-- `token: String(32)` removed (implementation)
-- `DateTime` became `Timestamp` (domain type)
-- Added derived `is_expired` for clarity
+- `candidate-id` remains an identifier in model state, while relationship semantics are carried by process usage
+- `token` removed (implementation concern)
+- wall-clock types became model-time numbers/timestamps
+- added a derived helper (`expired?`) for clarity
 
 ### Step 7: Validate with stakeholders
 
@@ -558,17 +577,17 @@ Common findings:
 - "Actually we wanted X but never built it"
 - "These two code paths should be the same but aren't"
 
-## Recognising library spec candidates
+## Recognising library model candidates
 
-During distillation, stay alert for code that implements **generic integration patterns** rather than application-specific logic. These belong in library specs, not your main specification.
+During distillation, stay alert for code that implements **generic integration patterns** rather than application-specific logic. These belong in library models, not your main specification.
 
-The same principle applies in elicitation. When a stakeholder describes "we use Google for login" or "payments go through Stripe", pause and consider whether this is a library spec.
+The same principle applies in elicitation. When a stakeholder describes "we use Google for login" or "payments go through Stripe", pause and consider whether this is a library model.
 
 ### Signals in the code
 
 **Third-party integration modules:**
 ```python
-# Finding code like this suggests a library spec
+# Finding code like this suggests a library model
 class StripeWebhookHandler:
     def handle_invoice_paid(self, event):
         ...
@@ -606,92 +625,94 @@ OAUTH_CONFIG = {
    Application: what to do when payment succeeds.
 
 2. **"Would another application integrate the same way?"**
-   If yes, library spec candidate. If no, probably application-specific.
+   If yes, library model candidate. If no, probably application-specific.
 
 3. **"Does the code separate integration from application concerns?"**
-   If cleanly separated, easy to extract to library spec. If tangled, might need refactoring first (but the spec should still separate them).
+   If cleanly separated, easy to extract to library model. If tangled, might need refactoring first (but the spec should still separate them).
 
 ### How to handle
 
-**Option 1: Reference an existing library spec**
+**Option 1: Reference an existing library model**
 
-If a standard library spec exists for this integration:
+If a standard library model exists for this integration:
+```clojure
+(ns app.billing.model
+  (:require [libs.stripe-billing.model :as stripe]
+            [recife.core :as r]))
+
+;; Application responds to Stripe events emitted into model state
+(r/defproc activate-subscription
+  (fn [{:keys [::stripe/events] :as db}]
+    (if-let [invoice (first (filter #(= :payment-succeeded (:type %)) events))]
+      (assoc-in db [::subscriptions (:subscription-id invoice) :status] :active)
+      db)))
 ```
-use "github.com/allium-specs/stripe-billing/abc123" as stripe
 
--- Application responds to Stripe events
-rule ActivateSubscription {
-    when: stripe/PaymentSucceeded(invoice)
-    ...
-}
-```
-
-**Option 2: Create a separate library spec**
+**Option 2: Create a separate library model**
 
 If no standard spec exists but the integration is generic:
-```
--- greenhouse-ats.allium (library spec)
--- Specifies: Greenhouse webhook events, candidate sync, etc.
+```clojure
+;; greenhouse_ats/model.clj (library model)
+;; Defines: greenhouse inbound events, normalization, sync semantics.
 
--- interview-scheduling.allium (application spec)
-use "./greenhouse-ats.allium" as greenhouse
+;; interview_scheduling/model.clj (application model)
+(ns interview-scheduling.model
+  (:require [greenhouse-ats.model :as greenhouse]
+            [recife.core :as r]))
 
-rule ImportCandidate {
-    when: greenhouse/CandidateCreated(data)
-    ensures: Candidacy.created(...)
-}
+(r/defproc import-candidate
+  (fn [{:keys [::greenhouse/events] :as db}]
+    (if-let [event (first (filter #(= :candidate-created (:type %)) events))]
+      (assoc-in db [::candidacies (keyword (:candidate-id event))]
+                {:source :greenhouse})
+      db)))
 ```
 
 **Option 3: Abstract and move on**
 
 If the integration is minor, just abstract it:
-```
--- Don't specify Slack details, just:
-ensures: Notification.created(
-    to: interviewers,
-    channel: slack
-)
+```clojure
+;; Do not model Slack API details, just model the domain event:
+(update db :notifications/outbox conj {:to interviewer-ids :channel :slack})
 ```
 
 ### Red flags: integration logic in your spec
 
 If you find yourself writing spec like this, stop and reconsider:
 
-```
--- TOO DETAILED - this is Stripe's domain, not yours
-rule ProcessStripeWebhook {
-    when: WebhookReceived(payload, signature)
-
-    requires: verify_stripe_signature(payload, signature)
-
-    let event = parse_stripe_event(payload)
-
-    if event.type = "invoice.paid":
-        ...
-}
+```clojure
+;; TOO DETAILED - this is Stripe's domain, not yours
+(r/defproc process-stripe-webhook
+  (fn [{:keys [payload signature] :as db}]
+    (when (verify-stripe-signature payload signature)
+      (let [event (parse-stripe-event payload)]
+        (if (= "invoice.paid" (:type event))
+          ...
+          db)))))
 ```
 
 Instead:
+```clojure
+;; Application responds to normalized payment events (integration handled elsewhere)
+(r/defproc payment-received
+  (fn [{:keys [::billing/events] :as db}]
+    (if-let [invoice (first (filter #(= :invoice-paid (:type %)) events))]
+      ...
+      db)))
 ```
--- Application responds to payment events (integration handled elsewhere)
-rule PaymentReceived {
-    when: stripe/InvoicePaid(invoice)
-    ...
-}
-```
 
-### Common library spec extractions
+### Common library model extractions
 
-| Code pattern found | Library spec candidate |
-|-------------------|----------------------|
-| OAuth token exchange, refresh, session management | `oauth2.allium` |
-| Stripe webhook handling, subscription lifecycle | `stripe-billing.allium` |
-| Email sending with templates, bounce handling | `email-delivery.allium` |
-| Calendar event sync, availability checking | `calendar-integration.allium` |
-| ATS candidate import, status sync | `greenhouse-ats.allium`, `lever-ats.allium` |
-| File upload, virus scanning, thumbnail generation | `file-storage.allium` |
+| Code pattern found | Library model candidate |
+|-------------------|-------------------------|
+| OAuth token exchange, refresh, session management | `oauth2/model.clj` |
+| Stripe webhook handling, subscription lifecycle | `stripe_billing/model.clj` |
+| Email sending with templates, bounce handling | `email_delivery/model.clj` |
+| Calendar event sync, availability checking | `calendar_integration/model.clj` |
+| ATS candidate import, status sync | `greenhouse_ats/model.clj`, `lever_ats/model.clj` |
+| File upload, virus scanning, thumbnail generation | `file_storage/model.clj` |
 
-See patterns.md Pattern 8 for detailed examples of integrating library specs.
+See patterns.md Pattern 8 for detailed examples of integrating library models.
 
 ## Common distillation challenges
 
@@ -702,7 +723,7 @@ When you find two terms for the same concept (across specs, within a spec, or be
 ```
 -- BAD: Acknowledges duplication without resolving it
 -- Order vs Purchase
--- checkout.allium uses "Purchase" - these are equivalent concepts.
+;; checkout/model.clj uses \"Purchase\" - these are equivalent concepts.
 ```
 
 This is not a resolution. When different parts of a codebase are built against different specs, both terms end up in the implementation: duplicate models, redundant join tables, foreign keys pointing both ways.
@@ -739,14 +760,14 @@ The implicit states are:
 - `submitted`: feedback_id set
 
 Extract to explicit:
-```
-entity FeedbackRequest {
-    interview: Interview
-    interviewer: Interviewer
-    requested_at: Timestamp
-    reminded_at: Timestamp?
-    status: pending | reminded | submitted
-}
+```clojure
+(def global
+  {::feedback-requests
+   {:fr-1 {:interview-id :int-1
+           :interviewer-id :i-1
+           :requested-at 1739181600000
+           :reminded-at nil
+           :status :pending}}})
 ```
 
 ### Challenge: Scattered logic
@@ -773,15 +794,15 @@ def process_acceptance(invitation, slot):
 ```
 
 Consolidate into one rule:
-```
-rule CandidateAccepts {
-    when: CandidateAccepts(invitation, slot)
-
-    requires: invitation.status = pending
-    requires: invitation.expires_at > now
-    requires: slot in invitation.slots
-    ...
-}
+```clojure
+(r/defproc candidate-accepts
+  (fn [{:keys [::invitations :commands/candidate-accepts :clock/now] :as db}]
+    (when-let [{:keys [invitation-id slot-id]} (first candidate-accepts)]
+      (let [invitation (get invitations invitation-id)]
+        (when (and (= :pending (:status invitation))
+                   (> (:expires-at invitation) now)
+                   (contains? (set (:slot-ids invitation)) slot-id))
+          ...)))))
 ```
 
 ### Challenge: Dead code and historical accidents
@@ -806,8 +827,8 @@ def send_notification(user, message):
 ```
 
 The spec should capture the intended behaviour, not the bug:
-```
-ensures: Notification.created(to: user, channel: slack)
+```clojure
+(update db :notifications/outbox conj {:to user-id :channel :slack :message message})
 ```
 
 Whether the current implementation properly handles failures is separate from what the system should do.
@@ -829,11 +850,11 @@ public class SlackNotificationStrategy implements NotificationStrategy {
 }
 ```
 
-Cut through to the actual behaviour. The spec does not need strategy patterns, dependency injection or abstract factories. Just: `ensures: Notification.created(channel: slack, ...)`
+Cut through to the actual behaviour. The model does not need strategy patterns, dependency injection or abstract factories. Just model the emitted event/state update, e.g. `(update db :notifications/outbox conj {:channel :slack ...})`.
 
 ## Checklist: Have you abstracted enough?
 
-Before finalising a distilled spec:
+Before finalising a distilled model:
 
 - [ ] No database column types (Integer, VARCHAR, etc.)
 - [ ] No ORM or query syntax
@@ -844,18 +865,18 @@ Before finalising a distilled spec:
 - [ ] No infrastructure (Redis, Kafka, S3, etc.)
 - [ ] Foreign keys replaced with relationships
 - [ ] Tokens/secrets removed (implementation of identity)
-- [ ] Timestamps use domain Duration, not timedelta/seconds
+- [ ] Time handling uses explicit model fields/config, not ad-hoc timedelta literals scattered through code
 
 If any remain, ask: "Would a stakeholder include this in a requirements doc?"
 
 ## Checklist: Terminology consistency
 
-- [ ] Each concept has exactly one name throughout the spec
+- [ ] Each concept has exactly one name throughout the model
 - [ ] No "also known as" or "equivalent to" comments
-- [ ] Cross-referenced related specs for conflicting terms
+- [ ] Cross-referenced related models for conflicting terms
 - [ ] Duplicate models in code flagged as technical debt to remove
 
 ## References
 
-- [Language reference](../../references/language-reference.md) — full Allium syntax
+- [Language reference](../../references/language-reference.md) — full Recife syntax
 - [Worked examples](./references/worked-examples.md) — complete code-to-spec examples in Python, TypeScript and Java

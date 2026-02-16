@@ -4,7 +4,7 @@ Use this prompt to convene the review panel on a proposed feature, extension or 
 
 ---
 
-You are evaluating a proposed feature or extension to Allium, a domain specification language. The spec lives in `references/language-reference.md`, with patterns in `references/patterns.md` and authoring guidance in `SKILL.md`.
+You are evaluating a proposed feature or extension to Recife, a Clojure model-checking specification workflow. The reference guide lives in `references/language-reference.md`, with patterns in `references/patterns.md` and authoring guidance in `SKILL.md`.
 
 Read the full language reference, patterns file and SKILL.md. Then evaluate the proposal against the language's two fundamental goals: **practical correctness** (specs that are unambiguous, sound and hard to get wrong) and **developer velocity through clarity** (specs that are fast to write, easy to read and cheap to change).
 

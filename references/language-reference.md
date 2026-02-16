@@ -2,1550 +2,734 @@
 
 ## File structure
 
-An Allium specification file (`.allium`) begins with a language version marker, followed by these sections in order:
+A Recife model file is a Clojure source file (`.clj`) with a namespace, required libraries and model components.
 
+```clojure
+(ns interview-scheduling.model
+  (:require [clojure.set :as set]
+            [recife.core :as r]
+            [recife.helpers :as rh]))
+
+;; Scope: interview scheduling for hiring pipeline
+;; Includes: candidacy, invitation, slot confirmation, reminders
+;; Excludes: authentication, billing
+
+(def global
+  {::candidacies {}
+   ::invitations {}
+   ::slots {}
+   ::config {:invitation-expiry-ms (* 7 24 60 60 1000)}
+   :clock/now 0
+   :mail/outbox []
+   :notifications/outbox []})
+
+(r/defproc invitation-expires
+  (fn [{:keys [::invitations ::slots :clock/now] :as db}]
+    (reduce-kv (fn [acc invitation-id invitation]
+                 (if (and (= :pending (:status invitation))
+                          (<= (:expires-at invitation) now))
+                   (let [acc' (assoc-in acc [::invitations invitation-id :status] :expired)]
+                     (reduce (fn [x sid] (assoc-in x [::slots sid :status] :available))
+                             acc'
+                             (:slot-ids invitation)))
+                   acc))
+               db
+               invitations)))
+
+(rh/definvariant invitation-status-valid
+  [{:keys [::invitations]}]
+  (every? (fn [[_ inv]]
+            (contains? #{:pending :accepted :declined :expired}
+                       (:status inv)))
+          invitations))
+
+(comment
+  @(r/run-model global #{invitation-expires invitation-status-valid}))
 ```
--- allium: 1
--- Comments use double-dash
--- use declarations (optional)
 
-------------------------------------------------------------
--- Given
-------------------------------------------------------------
+A typical model file contains:
 
--- Entity instances this module operates on (optional)
-
-------------------------------------------------------------
--- External Entities
-------------------------------------------------------------
-
--- Entities managed outside this specification
-
-------------------------------------------------------------
--- Value Types
-------------------------------------------------------------
-
--- Structured data without identity (optional section)
-
-------------------------------------------------------------
--- Enumerations
-------------------------------------------------------------
-
--- Named enumerations shared across entities (optional section)
-
-------------------------------------------------------------
--- Entities and Variants
-------------------------------------------------------------
-
--- Entities managed by this specification, plus their variants
-
-------------------------------------------------------------
--- Config
-------------------------------------------------------------
-
--- Configurable parameters for this specification
-
-------------------------------------------------------------
--- Defaults
-------------------------------------------------------------
-
--- Default entity instances
-
-------------------------------------------------------------
--- Rules
-------------------------------------------------------------
-
--- Behavioural rules organised by flow
-
-------------------------------------------------------------
--- Actor Declarations
-------------------------------------------------------------
-
--- Entity types that can interact with surfaces
-
-------------------------------------------------------------
--- Surfaces
-------------------------------------------------------------
-
--- Boundary contracts between parties
-
-------------------------------------------------------------
--- Deferred Specifications
-------------------------------------------------------------
-
--- References to detailed specs defined elsewhere
-
-------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
--- Unresolved design decisions
-```
+- `ns` declaration
+- initial model state (`global`)
+- one or more processes (`r/defproc`)
+- checks (`rh/definvariant`, `rh/defproperty`, `rh/defaction-property`)
+- optional execution block in `comment`
 
 ### Formatting
 
-Indentation is significant. Blocks opened by a colon (`:`) after `for`, `if`, `else`, `ensures`, `exposes`, `provides`, `related`, `timeout`, `guarantee` and `guidance` are delimited by consistent indentation relative to the parent clause. Comments use `--`. Commas may be used as field separators for single-line entity and value type declarations; newlines are the standard separator for multi-line declarations.
+Indentation is conventional Clojure indentation. Keep process functions small and explicit. Prefer one transition concern per process step. Use namespaced keywords for global state and unnamespaced keys only for process-local variables.
 
 ### Naming conventions
 
-- **PascalCase**: entity names, variant names, rule names, trigger names, actor names, surface names (`InterviewSlot`, `CandidateSelectsSlot`)
-- **snake_case**: field names, config parameters, derived values, enum literals, relationship names (`expires_at`, `max_login_attempts`, `pending`)
-- **Entity collections**: natural English plurals of the entity name (`Users`, `Documents`, `Candidacies`)
+- **Namespaces**: kebab-case (`interview-scheduling.model`)
+- **Vars**: kebab-case (`invitation-expires`, `candidate-accepts`)
+- **Global keys**: namespaced keywords (`::invitations`, `:mail/outbox`)
+- **Local keys**: short unnamespaced keys (`:pc`, `:self`, `:slot-id`)
+- **Statuses/tags**: namespaced or plain keywords (`:pending`, `:accepted`, `:branch`)
 
 ---
 
 ## Module given
 
-A `given` block declares the entity instances a module operates on. All rules in the module inherit these bindings.
+Recife does not have a `given {}` keyword. Equivalent shared context is represented in `global` and per-process local maps.
 
+```clojure
+(def global
+  {::pipeline {:status :active}
+   ::calendar {:available-slot-ids #{:s1 :s2 :s3}}})
+
+(r/defproc choose-slot
+  (fn [{:keys [::pipeline ::calendar] :as db}]
+    (if (= :active (:status pipeline))
+      (assoc db ::last-available (first (:available-slot-ids calendar)))
+      db)))
 ```
-given {
-    pipeline: HiringPipeline
-    calendar: InterviewCalendar
-}
+
+Use `:local` with `defproc` when each process instance needs isolated local state.
+
+```clojure
+(r/defproc reminder-worker
+  {:procs #{:w1 :w2}
+   :local {:pc ::scan
+           :batch-size 10}}
+  {::scan
+   (fn [{:keys [:batch-size] :as db}]
+     (if (> batch-size 0)
+       (r/goto db ::send)
+       (r/done db)))
+
+   ::send
+   (fn [db]
+     (-> db
+         (assoc :batch-size 0)
+         r/done))})
 ```
-
-Rules then reference `pipeline.status`, `calendar.available_slots`, etc. without ambiguity about what they refer to.
-
-Not every module needs a `given` block. Rules scoped by triggers on domain entities (e.g., `when: invitation: Invitation.expires_at <= now`) get their entities from the trigger binding. `given` is for specs where rules operate on shared instances that exist once per module scope, such as a pipeline, a catalog or a processing engine.
-
-`given` bindings must reference entity types declared in the same module or imported via `use`. Imported module instances are accessed via qualified names (`scheduling/calendar`) and do not need to appear in the local `given` block. Modules that operate only on imported instances may omit the `given` block entirely.
-
-This is distinct from surface `context`, which binds a parametric scope for a boundary contract (e.g., `context assignment: SlotConfirmation`).
 
 ---
 
 ## Entities
 
+In Recife, entities are usually map entries under namespaced collections.
+
+```clojure
+(def global
+  {::candidacies
+   {:cand-1 {:candidate-id :u-1
+             :role-id :role-1
+             :status :pending
+             :slot-ids #{:slot-1 :slot-2}}}})
+```
+
 ### External entities
 
-Entities referenced but managed outside this specification:
+External systems are represented as inbound/outbound queues and normalized projections.
 
+```clojure
+(def global
+  {:greenhouse/inbound #{}
+   :stripe/events #{}
+   ::candidates {}})
+
+(r/defproc import-candidate
+  (fn [{:keys [:greenhouse/inbound] :as db}]
+    (when-let [event (first inbound)]
+      (-> db
+          (update :greenhouse/inbound disj event)
+          (assoc-in [::candidates (keyword (:id event))]
+                    {:name (:name event)
+                     :email (:email event)
+                     :source :greenhouse})))))
 ```
-external entity Role {
-    title: String
-    required_skills: Set<Skill>
-    location: Location
-}
-```
-
-External entities define their structure but not their lifecycle. The specification checker will warn when external entities are referenced, reminding that another spec or system governs them.
-
-External entities can also serve as **type placeholders**: an entity with minimal or no fields that the consuming spec substitutes with a concrete type. This enables reusable patterns where the library spec depends on an abstraction and the consumer provides the implementation.
-
-```
--- In a comments library spec
-external entity Commentable {}
-
-entity Comment {
-    parent: Commentable
-    ...
-}
-
--- The consuming spec provides its own entity as the Commentable
-```
-
-The consuming spec maps its entity to the placeholder by using it wherever the library expects the placeholder type. This is dependency inversion at the spec level: the library depends on the abstraction, the consumer supplies the concrete type.
 
 ### Internal entities
 
-```
-entity Candidacy {
-    -- Fields (required)
-    candidate: Candidate
-    role: Role
-    status: pending | active | completed | cancelled
+Internal entities are state maps managed by model transitions.
 
-    -- Relationships (navigate to related entities)
-    invitation: Invitation with candidacy = this
-    slots: InterviewSlot with candidacy = this
-
-    -- Projections (filtered subsets)
-    confirmed_slots: slots where status = confirmed
-    pending_slots: slots where status = pending
-
-    -- Derived (computed values)
-    is_ready: confirmed_slots.count >= 3
-    has_expired: invitation.expires_at <= now
-}
+```clojure
+(def global
+  {::invitations
+   {:inv-1 {:candidacy-id :cand-1
+            :status :pending
+            :slot-ids #{:slot-1 :slot-2}
+            :expires-at 1739786400000}}
+   ::slots
+   {:slot-1 {:status :confirmed}
+    :slot-2 {:status :confirmed}}})
 ```
 
 ### Value types
 
-Structured data without identity. No lifecycle, compared by value not reference. Use for concepts such as time ranges and addresses.
+Value types are plain immutable Clojure values (maps, vectors, sets, numbers, strings).
 
+```clojure
+(defn time-range [start end]
+  {:start start
+   :end end
+   :duration-ms (- end start)})
+
+(defn location [name tz country]
+  {:name name
+   :timezone tz
+   :country country})
 ```
-value TimeRange {
-    start: Timestamp
-    end: Timestamp
-
-    -- Derived
-    duration: end - start
-}
-
-value Location {
-    name: String
-    timezone: String
-    country: String?
-}
-```
-
-Value types have no identity, are immutable and are embedded within entities. Entities have identity, lifecycle and rules that govern them.
 
 ### Sum types
 
-Sum types (discriminated unions) specify that an entity is exactly one of several alternatives.
+Use tagged maps with `:kind` (or `:type`) and branch with `case`/`cond`.
 
-```
-entity Node {
-    path: Path
-    kind: Branch | Leaf              -- discriminator field
-}
+```clojure
+(def node-branch {:kind :branch :path "/" :children [:n1 :n2]})
+(def node-leaf {:kind :leaf :path "/tmp/a" :data [1 2 3]})
 
-variant Branch : Node {
-    children: List<Node?>            -- variant-specific field
-}
-
-variant Leaf : Node {
-    data: List<Integer>              -- variant-specific fields
-    log: List<Integer>
-}
+(defn process-node [node]
+  (case (:kind node)
+    :branch (count (:children node))
+    :leaf (count (:data node))
+    0))
 ```
 
-A sum type has three parts: a **discriminator field** whose type is a pipe-separated list of variant names, **variant declarations** using `variant X : BaseEntity`, and **variant-specific fields** that only exist for that variant. Variants inherit all fields from the base entity; the discriminator is set automatically on creation.
-
-**Distinguishing sum types from enums:** lowercase values are enum literals (`status: pending | active`), capitalised values are variant references (`kind: Branch | Leaf`). The validator checks that capitalised names correspond to `variant` declarations.
-
-**Creating variant instances** — always via the variant name, not the base:
-
-```
-ensures: MentionNotification.created(user: recipient, comment: comment, mentioned_by: author)
--- Not: Notification.created(...)  -- Error: must specify which variant
-```
-
-**Type guards** narrow an entity to a specific variant, enabling access to its fields. They appear in `requires` clauses (guarding the entire rule) and `if` expressions (guarding a branch):
-
-```
--- requires guard: entire rule assumes Leaf
-rule ProcessLeaf {
-    when: ProcessNode(node)
-    requires: node.kind = Leaf
-    ensures: Results.created(data: node.data + node.log)
-}
-
--- if guard: branch-level narrowing
-rule ProcessNode {
-    when: ProcessNode(node)
-    ensures:
-        if node.kind = Branch:
-            for child in node.children: ProcessNode(child)
-        else:
-            Results.created(data: node.data + node.log)
-}
-```
-
-Accessing variant-specific fields outside a type guard is an error. Sum types guarantee exhaustiveness (all variants declared upfront), mutual exclusivity (exactly one variant), type safety (variant fields only within guards) and automatic discrimination (set on creation).
-
-A `.created` trigger on the base entity fires when any variant is created. The bound variable holds the specific variant instance, and type guards can narrow it:
-
-```
-rule HandleNotification {
-    when: notification: Notification.created
-    ensures:
-        if notification.kind = MentionNotification:
-            ...
-}
-```
-
-Use sum types when variants have fundamentally different data or behaviour. Do not use when simple status enums suffice or variants share most of their structure.
+A sum type discipline in Recife is by convention and checks (invariants), not grammar keywords.
 
 ### Field types
 
-**Primitive types:**
-- `String` — text
-- `Integer` — whole numbers. Underscores are ignored in numeric literals for readability: `100_000_000`
-- `Decimal` — numbers with fractional parts (use for money, percentages)
-- `Boolean` — `true` or `false`
-- `Timestamp` — point in time. The built-in value `now` evaluates to the current timestamp. Its evaluation model depends on context: in derived values, `now` re-evaluates on each read (making the derived value volatile); in ensures clauses, `now` is bound to the rule execution timestamp (a snapshot); in temporal triggers, `now` is the evaluation timestamp with fire-once semantics.
-- `Duration` — length of time, written as a numeric literal with a unit suffix: `.seconds`, `.minutes`, `.hours`, `.days`, `.weeks`, `.months`, `.years` (e.g., `24.hours`, `7.days`, `30.seconds`). Both singular and plural forms are valid: `1.hour` and `24.hours`.
+Common Recife field shapes:
 
-Primitive types have no properties or methods. For domain-specific string types (email addresses, URLs), use value types or plain `String` fields with descriptive names. For operations on primitives beyond the built-in operators, use black box functions (e.g., `length(password)`, `hash(password)`).
+- string: `"abc"`
+- integer: `42`
+- decimal: `12.5`
+- boolean: `true` / `false`
+- timestamp/ms: `1739786400000`
+- optional: `nil` or value
+- set: `#{:a :b}`
+- vector/list-like: `[:a :b :c]`
+- nested map: `{:status :pending :expires-at 0}`
 
-**Compound types:**
-- `Set<T>` — unordered collection of unique items
-- `List<T>` — ordered collection (use when order matters)
-- `T?` — optional (may be absent)
+Represent absence with `nil`.
 
-**Checking for absent values:**
-```
-requires: request.reminded_at = null      -- field is absent/unset
-requires: request.reminded_at != null     -- field has a value
-```
-
-`null` represents the absence of a value for optional fields.
-
-`field = null` and `field != null` are presence checks, not comparisons. `field = null` is true when the field is absent; `field != null` is true when the field has a value. Comparisons with null produce false: `null <= now` is false, `null > 0` is false. Arithmetic with null produces null: `null + 1.day` is null. This means temporal triggers on optional fields (e.g., `when: user: User.next_digest_at <= now`) do not fire when the field is absent.
-
-**Enumerated types (inline):**
-```
-status: pending | confirmed | declined | expired
-```
-
-**Named enumerations:**
-```
-enum Recommendation { strong_yes | yes | no | strong_no }
-enum DayOfWeek { monday | tuesday | wednesday | thursday | friday | saturday | sunday }
-```
-
-Named enumerations define a reusable set of values. Declare them in the Enumerations section of the file. Reference them as field types: `recommendation: Recommendation`. Inline enums (`status: pending | active`) are equivalent but anonymous; use named enums when the same set of values appears in multiple fields or entities.
-
-Inline enums are anonymous: they have no type identity. Two inline enum fields cannot be compared with each other, whether on the same entity or across entities; the checker reports an error. Use a named enum when values need to be compared across fields. Named enums are distinct types: a field typed `Recommendation` cannot be compared with a field typed `DayOfWeek`, even if they happen to share a literal.
-
-This catches a common mistake when tracking previous state:
-
-```
--- Error: cannot compare two inline enum fields
-entity Order {
-    status: pending | shipped | delivered
-    previous_status: pending | shipped | delivered
-}
-requires: order.status != order.previous_status    -- checker error
-
--- Fix: extract a named enum
-enum OrderStatus { pending | shipped | delivered }
-entity Order {
-    status: OrderStatus
-    previous_status: OrderStatus
-}
-requires: order.status != order.previous_status    -- valid
-```
-
-**Entity references:**
-```
-candidate: Candidate
-role: Role
+```clojure
+(defn reminded? [feedback-request]
+  (some? (:reminded-at feedback-request)))
 ```
 
 ### Relationships
 
-Always use singular entity names; the relationship name indicates plurality:
+Relationships are modeled by identifiers and lookups.
 
+```clojure
+(def global
+  {::candidacies {:cand-1 {:slot-ids #{:slot-1 :slot-2}}}
+   ::slots {:slot-1 {:status :confirmed}
+            :slot-2 {:status :pending}}})
+
+(defn candidacy-slots [db candidacy-id]
+  (->> (get-in db [::candidacies candidacy-id :slot-ids])
+       (map #(get-in db [::slots %]))))
 ```
--- One-to-one (singular relationship name)
-invitation: Invitation with candidacy = this
-
--- One-to-many (plural relationship name, but singular entity name)
-slots: InterviewSlot with candidacy = this
-feedback_requests: FeedbackRequest with interview = this
-
--- Self-referential
-replies: Comment with reply_to = this
-```
-
-The `with X = this` syntax declares a relationship by naming the field on the related entity that points back. `this` refers to the enclosing entity instance. The syntax is the same whether the relationship is one-to-one, one-to-many or self-referential.
-
-The relationship name determines the cardinality:
-
-- **Singular name** (e.g., `invitation`) — at most one related entity. The value is the entity instance, or `null` if none exists. Equivalent to `T?`. If multiple entities match a singular relationship, the specification is in error and the checker should report it.
-- **Plural name** (e.g., `slots`) — zero or more related entities. The value is a collection, empty if none exist.
 
 ### Projections
 
-Named filtered views of relationships:
+A projection is a derived filtered view.
 
+```clojure
+(defn confirmed-slots [db candidacy-id]
+  (->> (get-in db [::candidacies candidacy-id :slot-ids])
+       (map #(vector % (get-in db [::slots %])))
+       (filter (fn [[_ slot]] (= :confirmed (:status slot))))
+       (map first)
+       set))
 ```
--- Simple status filter
-confirmed_slots: slots where status = confirmed
-
--- Multiple conditions
-active_requests: feedback_requests where status = pending and requested_at > cutoff
-
--- Projection with mapping
-confirmed_interviewers: confirmations where status = confirmed -> interviewer
-```
-
-The `-> field` syntax extracts a field from each matching entity. When the extracted field is optional (`T?`), null values are excluded from the result: the projection produces `Set<T>`, not `Set<T?>`.
 
 ### Derived values
 
-Computed from other fields. Always read-only and automatically updated.
+Derived values are plain helper functions over state.
 
+```clojure
+(defn invitation-expired? [invitation now]
+  (<= (:expires-at invitation) now))
+
+(defn candidacy-ready? [db candidacy-id]
+  (>= (count (confirmed-slots db candidacy-id)) 3))
 ```
--- Boolean derivations
-is_valid: interviewers.any(i => i.can_solo) or interviewers.count >= 2
-is_expired: expires_at <= now
-all_responded: pending_requests.count = 0
-
--- Value derivations
-time_remaining: deadline - now
-
--- Parameterised derived values
-can_use_feature(f): f in plan.features
-has_permission(p): p in role.effective_permissions
-```
-
-Parameters are locally scoped to the expression. Parameterised derived values cannot reference module `given` bindings or global state; they operate only on the entity's own fields and their parameter. No side effects.
 
 ---
 
 ## Rules
 
-Rules define behaviour: what happens when triggers occur.
+Rules are process transitions (`r/defproc`) plus checks (`rh/*`).
 
 ### Rule structure
 
+```clojure
+(r/defproc candidate-accepts
+  (fn [{:keys [::invitations ::slots :commands/candidate-accepts :clock/now] :as db}]
+    (when-let [{:keys [invitation-id slot-id]} (first candidate-accepts)]
+      (let [invitation (get invitations invitation-id)]
+        (when (and (= :pending (:status invitation))
+                   (> (:expires-at invitation) now)
+                   (contains? (set (:slot-ids invitation)) slot-id))
+          (-> db
+              (update :commands/candidate-accepts disj {:invitation-id invitation-id :slot-id slot-id})
+              (assoc-in [::invitations invitation-id :status] :accepted)
+              (assoc-in [::slots slot-id :status] :booked)))))))
 ```
-rule RuleName {
-    when: TriggerCondition
-
-    let binding1 = expression      -- bindings can appear before requires
-
-    requires: Precondition1
-    requires: Precondition2
-
-    let binding2 = expression      -- or between requires and ensures
-
-    ensures: Postcondition1
-    ensures: Postcondition2
-}
-```
-
-| Clause | Purpose |
-|--------|---------|
-| `when` | What triggers this rule |
-| `for` | Iterate: apply the rule body for each element in a collection |
-| `let` | Local variable bindings (can appear anywhere after `when`) |
-| `requires` | Preconditions that must be true (rule fails if not met) |
-| `ensures` | What becomes true after the rule executes |
-
-Place `let` bindings where they make the rule most readable, typically just before the clause that first uses them.
 
 ### Rule-level iteration
 
-A `for` clause applies the rule body once per element in a collection. The binding variable is available in all subsequent clauses.
+Use `reduce`, `map`, `for`, `doseq`-style pure transformations.
 
+```clojure
+(r/defproc expire-old-invitations
+  (fn [{:keys [::invitations :clock/now] :as db}]
+    (reduce-kv (fn [acc invitation-id invitation]
+                 (if (and (= :pending (:status invitation))
+                          (<= (:expires-at invitation) now))
+                   (assoc-in acc [::invitations invitation-id :status] :expired)
+                   acc))
+               db
+               invitations)))
 ```
-rule ProcessDigests {
-    when: schedule: DigestSchedule.next_run_at <= now
-    for user in Users where notification_setting.digest_enabled:
-        let settings = user.notification_setting
-        ensures: DigestBatch.created(user: user, ...)
-}
-```
-
-The `where` keyword filters the collection, consistent with projection syntax. The indented body contains the rule's `let`, `requires` and `ensures` clauses scoped to each element.
-
-This is the same `for x in collection:` construct used in ensures blocks and surfaces. The body inherits the constraints of its enclosing context: at rule level it wraps `let`, `requires` and `ensures` clauses; inside an ensures block it wraps postconditions (state changes, entity creation, trigger emissions, removal assertions); inside a surface it wraps the items permitted by the enclosing clause (`exposes`, `provides` or `related`).
 
 ### Multiple rules for the same trigger
 
-When multiple rules share a trigger, their `requires` clauses determine which fires. If preconditions overlap such that multiple rules could match simultaneously, this is a spec ambiguity. The specification checker should warn when rules with the same trigger have overlapping preconditions.
+Model a trigger as an event queue and let multiple processes consume/respond.
+
+```clojure
+(def global
+  {:auth/events #{}
+   :audit/log []
+   ::sessions {}})
+
+(r/defproc lock-account-on-failures
+  (fn [{:keys [:auth/events] :as db}]
+    ...))
+
+(r/defproc audit-auth-events
+  (fn [{:keys [:auth/events] :as db}]
+    ...))
+```
 
 ### Trigger types
 
-**External stimulus** — action from outside the system:
-```
-when: AdminApprovesInterviewers(admin, suggestion, interviewers, times)
-when: CandidateSelectsSlot(invitation, slot)
-```
+Recife trigger patterns:
 
-**Optional parameters** use the `?` suffix:
-```
-when: InterviewerReportsNoInterview(interviewer, interview, reason, details?)
-```
-
-**State transition** — entity changed state:
-```
-when: interview: Interview.status transitions_to scheduled
-when: confirmation: SlotConfirmation.status transitions_to confirmed
-```
-
-The variable before the colon binds the entity that triggered the transition. `transitions_to` fires when a field transitions to the specified value from a different value, not on initial entity creation (use `.created` for that). It is valid for enum fields, boolean fields and entity reference fields.
-
-**State becomes** — entity has a value, whether by creation or transition:
-```
-when: interview: Interview.status becomes scheduled
-```
-
-`becomes` fires both when an entity is created with the specified value and when a field transitions to that value from a different value. Like `transitions_to`, it is valid for enum fields, boolean fields and entity reference fields. It is equivalent to writing a `transitions_to` rule and a `.created` rule with a `requires` guard, combined into a single trigger. Use `becomes` when the rule should apply regardless of how the entity arrived at the state. Use `transitions_to` when the rule should only apply to transitions (e.g., sending a "rescheduled" notification that doesn't apply on initial creation).
-
-**Temporal** — time-based condition:
-```
-when: invitation: Invitation.expires_at <= now
-when: interview: Interview.slot.time.start - 1.hour <= now
-when: request: FeedbackRequest.requested_at + 24.hours <= now
-```
-
-Temporal triggers use explicit `var: Type` binding, the same as state transitions and entity creation. The binding names the entity instance and its type. Temporal triggers fire once when the condition becomes true. Always include a `requires` clause to prevent re-firing:
-```
-rule InvitationExpires {
-    when: invitation: Invitation.expires_at <= now
-    requires: invitation.status = pending  -- prevents re-firing
-    ensures: invitation.status = expired
-}
-```
-
-**Derived condition becomes true:**
-```
-when: interview: Interview.all_feedback_in
-when: slot: InterviewSlot.is_valid
-```
-
-Derived condition triggers fire when the value transitions from false to true, the same semantics as temporal triggers. If the derived value could revert to false and become true again, include a `requires` clause to prevent re-firing, just as with temporal triggers.
-
-**Entity creation** — fires when a new entity is created:
-```
-when: batch: DigestBatch.created
-when: mention: CommentMention.created
-```
-
-**Chained from another rule's trigger emission:**
-```
-when: AllConfirmationsResolved(candidacy)
-```
-
-A rule chains from another by subscribing to a trigger emission. The emitting rule includes the event in an ensures clause:
-
-```
-ensures: AllConfirmationsResolved(candidacy: candidacy)
-```
-
-The receiving rule subscribes via its `when` clause. This uses the same syntax as external stimulus triggers, but the stimulus comes from another rule rather than from outside the system.
+- **External stimulus**: inbound event queue (`:commands/*`, `:webhooks/*`)
+- **State transition**: status/value mutation via `assoc-in`/`update`
+- **State becomes**: guard checks target state and transitions once
+- **Temporal**: compare state timestamps with `:clock/now`
+- **Derived condition**: helper predicate in guard/invariant
+- **Entity creation**: insert map entry under collection key
+- **Chained**: process A writes queue/event consumed by process B
 
 ### Preconditions (requires)
 
-Preconditions must be true for the rule to execute. If not met, the trigger is rejected.
+Preconditions are `when`/`if` guards in process functions.
 
+```clojure
+(when (and (= :pending (:status invitation))
+           (> (:expires-at invitation) now)
+           (contains? (set (:slot-ids invitation)) slot-id))
+  ...)
 ```
-requires: invitation.status = pending
-requires: not invitation.is_expired
-requires: slot in invitation.slots
-requires: interviewer in interview.interviewers
-requires:
-    interviewers.count >= 2
-    or interviewers.any(i => i.can_solo)
-```
-
-**Precondition failure behaviour:**
-- For external stimulus triggers: The action is rejected; caller receives an error
-- For temporal/derived triggers: The rule simply does not fire; no error
-- For chained triggers: The chain stops; previous rules' effects still apply
 
 ### Local bindings (let)
 
-```
-let confirmation = SlotConfirmation{slot, interviewer}
-let time_until = interview.slot.time.start - now
-let is_urgent = time_until < 24.hours
-let is_modified =
-    interviewers != suggestion.suggested_interviewers
-    or proposed_times != suggestion.suggested_times
+Use `let` to name intermediate state and keep transitions readable.
+
+```clojure
+(let [invitation (get invitations invitation-id)
+      other-slot-ids (disj (set (:slot-ids invitation)) slot-id)]
+  ...)
 ```
 
 ### Discard bindings
 
-Use `_` where a binding is required syntactically but the value is not needed. Multiple `_` bindings in the same scope do not conflict.
+Use `_` for intentionally ignored values.
 
-```
-when: _: LogProcessor.last_flush_check + flush_timeout_hours <= now
-when: SomeEvent(_, slot)
-for _ in items: Counted(batch)
+```clojure
+(every? (fn [[_ invitation]]
+          (contains? #{:pending :accepted :declined :expired}
+                     (:status invitation)))
+        invitations)
 ```
 
 ### Postconditions (ensures)
 
-Postconditions describe what becomes true. They are declarative assertions about the resulting state, not imperative commands.
+Postconditions are represented by explicit new state values returned by the process.
 
-In state change assignments (`entity.field = expression`), the expression on the right references pre-rule field values. This avoids circular definitions: `user.count = user.count + 1` means the resulting count equals the original count plus one. Conditions within ensures blocks (`if` guards, creation parameters, trigger emission parameters) reference the resulting state as defined by the state changes. A `let` binding within an ensures block introduces a name visible to all subsequent statements in that block.
+Common patterns:
 
-Worked example: suppose `account.balance` is 100 before the rule fires.
-
-```
-ensures: account.balance = account.balance + 50       -- RHS reads pre-rule value: 100 + 50 = 150
-ensures:
-    if account.balance > 120:                          -- condition reads resulting state: 150 > 120, true
-        Notification.created(account: account, type: high_balance)
-```
-
-The assignment reads 100 (the pre-rule value). The `if` guard reads 150 (the resulting state after the assignment).
-
-Common mistake: assuming `if` guards in ensures read pre-rule values. Suppose `order.status` is `pending` before the rule fires.
-
-```
-ensures: order.status = shipped
-ensures:
-    if order.status = pending:                             -- WRONG: reads resulting state (shipped), so this is false
-        Notification.created(to: order.customer, template: order_pending_reminder)
-    if order.status = shipped:                             -- reads resulting state (shipped), so this is true
-        Notification.created(to: order.customer, template: order_shipped)
-```
-
-The author likely meant "if the order was pending before we changed it". But the `if` guard inside ensures reads the resulting state, not the pre-rule state. To test pre-rule values, use a `let` binding or `requires` clause before the ensures block.
-
-Ensures clauses have four forms:
-
-**State changes** — modify an existing entity's fields:
-```
-ensures: slot.status = booked
-ensures: invitation.status = accepted
-ensures: candidacy.retry_count = candidacy.retry_count + 1
-ensures: user.locked_until = null              -- clearing an optional field
-```
-
-Setting an optional field to `null` asserts the field becomes absent. Only valid for fields typed as optional (`T?`).
-
-**Entity creation** — create a new entity using `.created()`:
-```
-ensures: Interview.created(
-    candidacy: invitation.candidacy,
-    slot: slot,
-    interviewers: slot.confirmed_interviewers,
-    status: scheduled
-)
-
-ensures: Email.created(
-    to: candidate.email,
-    template: interview_invitation,
-    data: { slots: slots }
-)
-
-ensures: CalendarInvite.created(
-    attendees: interviewers + candidate,
-    time: slot.time,
-    duration: interview_type.duration
-)
-```
-
-Entity creation uses `.created()` exclusively. Domain meaning lives in entity names and rule names, not in creation verbs. `Email.created(...)` not `Email.sent(...)`.
-
-When creating entities that need to be referenced later in the same ensures block, use explicit `let` binding:
-```
-ensures:
-    let slot = InterviewSlot.created(time: time, candidacy: candidacy, status: pending)
-    for interviewer in interviewers:
-        SlotConfirmation.created(slot: slot, interviewer: interviewer)
-```
-
-A `let` binding within an ensures block is visible to all subsequent statements in that block, including nested `for` loops. It does not leak outside the ensures block.
-
-**Trigger emission** — emit a named event that other rules can chain from:
-```
-ensures: CandidateInformed(
-    candidate: candidacy.candidate,
-    about: slot_unavailable,
-    data: { available_alternatives: remaining_slots }
-)
-
-ensures: UserMentioned(user: mention.user, comment: comment, mentioned_by: author)
-ensures: FeatureUsed(workspace: workspace, feature: feature, by: user)
-```
-
-Trigger emissions are observable outcomes, not entity creation. They have no `.created()` call and are referenced by other rules' `when` clauses. Parameter values follow normal expression resolution: bound names are resolved first, then enum literals if the parameter has a declared type on the receiving rule. Bare identifiers that resolve to neither a binding nor an enum literal are a checker warning.
-
-**Entity removal:**
-```
-ensures: not exists target_membership
-ensures: not exists CommentMention{comment, user}
-```
-
-See [Existence](#existence) in the expression language for the full syntax including bulk removal and the distinction from soft delete.
-
-**Bulk updates:**
-```
-ensures:
-    for s in invitation.proposed_slots:
-        s.status = cancelled
-```
-
-**Conditional outcomes:**
-```
-ensures:
-    if candidacy.retry_count < 2:
-        candidacy.status = pending_scheduling
-    else:
-        candidacy.status = scheduling_stalled
-        Notification.created(...)
-```
+- state update: `(assoc-in db [::x id :status] :accepted)`
+- entity creation: `(assoc-in db [::y new-id] {:status :new})`
+- side-effect intent event: `(update db :mail/outbox conj {...})`
+- entity removal: `(update db ::tokens dissoc token-id)`
 
 ---
 
 ## Expression language
 
+Recife models use Clojure expressions.
+
 ### Navigation
 
+```clojure
+(get-in db [::invitations invitation-id :status])
+(-> db (get-in [::candidacies :cand-1]) :candidate-id)
 ```
--- Field access
-interview.status
-candidate.email
-
--- Relationship traversal
-interview.feedback_requests
-candidacy.slots
-
--- Chained navigation
-interview.candidacy.candidate.email
-feedback_request.interview.slot.time
-
--- Optional navigation (short-circuits to null if left side is null)
-inherits_from?.effective_permissions
-reply_to?.author
-
--- Null coalescing (provides default when left side is null)
-identity.timezone ?? "UTC"
-inherits_from?.effective_permissions ?? {}
-
--- Self-reference
-this                                        -- the instance being defined or identified
-replies: Comment with reply_to = this       -- all Comments whose reply_to is this entity
-```
-
-`this` refers to the instance of the enclosing type. It is valid in two contexts:
-
-- **Entity declarations**: `this` is the current entity instance. Available in relationships, projections and derived values.
-- **Actor `identified_by` expressions**: `this` is the entity instance being tested for actor membership (see [Actor declarations](#actor-declarations)).
 
 ### Join lookups
 
-For entities that connect two other entities (join tables):
-
-```
-let confirmation = SlotConfirmation{slot, interviewer}
-let feedback_request = FeedbackRequest{interview, interviewer}
-```
-
-Curly braces with field names look up the specific instance where those fields match. Any number of fields can be specified. Each name serves as both the field name on the entity and the local variable whose value is matched. The lookup must match at most one entity; if the fields do not uniquely identify a single instance, the specification is ambiguous and the checker should report an error. If no entity matches, the binding is null. Use `exists` to test whether a lookup matched before accessing fields on it; accessing fields on a null binding is an error.
-
-When the local variable name differs from the field name, use the explicit form:
-
-```
-let actor_membership = WorkspaceMembership{user: actor, workspace: workspace}
-let share = ResourceShare{resource: resource, user: inviter}
-requires: not exists User{email: new_email}
+```clojure
+(let [invitation (get-in db [::invitations :inv-1])
+      candidacy (get-in db [::candidacies (:candidacy-id invitation)])]
+  (:candidate-id candidacy))
 ```
 
 ### Collection operations
 
+```clojure
+(count slot-ids)
+(contains? slot-ids :slot-2)
+(some #(= :confirmed (:status %)) (vals slots))
+(every? #(contains? #{:pending :accepted} (:status %)) (vals invitations))
+(set/union #{:a} #{:b})
+(set/difference #{:a :b} #{:b})
 ```
--- Count
-slots.count
-pending_requests.count
-
--- Membership
-slot in invitation.slots
-interviewer in interview.interviewers
-
--- Any/All (always use explicit lambda)
-interviewers.any(i => i.can_solo)
-confirmations.all(c => c.status = confirmed)
-
--- Filtering (in projections and expressions)
-slots where status = confirmed
-requests where status in {submitted, escalated}
-
--- Iteration (introduces a scope block)
-for slot in slots: ...
-
--- Set mutation (ensures-only, modifies a relationship)
-interviewers.add(new_interviewer)
-interviewers.remove(leaving_interviewer)
-
--- Set arithmetic (expression-level, produces a new set)
-all_permissions: permissions + inherited_permissions
-removed_mentions: old_mentions - new_mentions
-
--- First/last (for ordered collections)
-attempts.first
-attempts.last
-```
-
-`.add()` and `.remove()` are ensures-only mutations on a relationship. Set `+` and `-` are expression-level operations that produce new sets without mutating anything.
 
 ### Comparisons
 
+```clojure
+(= :pending status)
+(not= :expired status)
+(< attempts max-attempts)
+(<= expires-at now)
 ```
-status = pending
-status != proposed
-count >= 2
-expires_at <= now
-time_until < 24.hours
-status in {confirmed, declined, expired}
-provider not in user.linked_providers
-```
-
-`{value1, value2, ...}` is a set literal used with `in` and `not in` for membership tests. This is the same set literal syntax used in field declarations and expressions.
 
 ### Arithmetic
 
+```clojure
+(+ now (* 7 24 60 60 1000))
+(- current-limit consumed)
+(>= usage quota)
 ```
-candidacy.retry_count + 1
-interview.slot.time.start - now
-feedback_request.requested_at + 24.hours
-now + 7.days
-recent_failures.count / config.window_sample_size
-price * quantity
-```
-
-Four operators: `+`, `-`, `*`, `/`. Standard precedence: `*` and `/` bind tighter than `+` and `-`. Use parentheses to override. Arithmetic involving null produces null (e.g., `null + 1.day` is null). Derived values computed from optional fields are implicitly optional.
 
 ### Boolean logic
 
+```clojure
+(and active? paid?)
+(or admin? support?)
+(not suspended?)
 ```
-interviewers.count >= 2 or interviewers.any(i => i.can_solo)
-invitation.status = pending and not invitation.is_expired
-not (a or b)  -- equivalent to: not a and not b
-```
-
-`and` and `or` short-circuit left to right. If the left operand of `or` is true, the right operand is not evaluated; if the left operand of `and` is false, the right operand is not evaluated. This permits patterns like `not exists x or not x.is_valid`, where the right side is only reached when `x` exists.
 
 ### Conditional expressions
 
-```
--- Inline (single values)
-email_status: if settings.email_on_mention = never: skipped else: pending
-thread_depth: if is_reply: reply_to.thread_depth + 1 else: 0
+```clojure
+(if overdue?
+  (assoc db :status :expired)
+  db)
 
--- Block (multiple outcomes)
-ensures:
-    if candidacy.retry_count < 2:
-        candidacy.status = pending_scheduling
-    else:
-        candidacy.status = scheduling_stalled
-        Notification.created(...)
-```
-
-Both forms use the same `if condition: ... else: ...` syntax. The inline form is for single-value assignments only. If either branch needs multiple statements or entity creation, use block form. Omit `else` when only the true branch has an effect.
-
-Multi-branch conditionals use `else if`:
-
-```
-let preference =
-    if notification.kind = MentionNotification: settings.email_on_mention
-    else if notification.kind = ReplyNotification: settings.email_on_comment
-    else if notification.kind = ShareNotification: settings.email_on_share
-    else: immediately
-```
-
-Each `else if` adds a branch. The final `else` provides a fallback.
-
-`exists` can also be used as a condition in `if` expressions, not just in `requires`. When `exists x` is used as an `if` condition, `x` is guaranteed non-null within the `if` body and can be accessed safely:
-
-```
-ensures:
-    if exists existing:
-        not exists existing
-    else:
-        CommentReaction.created(comment: comment, user: user, emoji: emoji)
+(cond
+  (= :pending status) :open
+  (= :accepted status) :closed
+  :else :unknown)
 ```
 
 ### Existence
 
-The `exists` keyword checks whether an entity instance exists. Use `not exists` for negation.
-
-```
--- Entity looked up via let binding
-let user = User{email}
-requires: exists user
-
--- Join entity lookup
-requires: exists WorkspaceMembership{user, workspace}
-
--- Negation
-requires: not exists User{email: email}
-requires: not exists ResourceInvitation{resource, email}
-```
-
-In `ensures` clauses, `not exists` asserts that an entity has been removed from the system:
-
-```
--- Entity removal
-ensures: not exists target_membership
-ensures: not exists CommentMention{comment, user}
-
--- Bulk removal
-ensures:
-    for d in workspace.deleted_documents:
-        not exists d
-```
-
-If the entity is already absent, the postcondition is trivially satisfied (no error, no operation). This follows from declarative semantics: `not exists x` asserts a property of the resulting state, not an imperative command.
-
-This is distinct from soft delete, which changes a field rather than removing the entity:
-
-```
--- Soft delete (entity still exists, status changes)
-ensures: document.status = deleted
-
--- Hard delete (entity no longer exists)
-ensures: not exists document
+```clojure
+(contains? invitations invitation-id)
+(some? (get-in db [::users user-id]))
+(nil? (get-in db [::feedback-requests req-id :reminded-at]))
 ```
 
 ### Literals
 
+```clojure
+"text"
+42
+12.5
+true
+false
+nil
+:pending
+#{:a :b}
+{:status :pending}
 ```
--- Set literals
-permissions: { "documents.read", "documents.write" }
-features: { basic_editing, api_access }
-
--- Object literals (anonymous records, used in creation parameters and trigger emissions)
-data: { candidate: candidate, time: time }
-data: { slots: remaining_slots }
-data: { unlocks_at: user.locked_until }
-```
-
-Object literals are anonymous record types. They carry named fields but have no declared type. Use them for ad-hoc data in entity creation parameters and trigger emission payloads where defining a named type would add ceremony without clarity. Object literals always require explicit `key: value` pairs; `{ x }` is a set literal containing `x`, not an object with shorthand.
 
 ### Black box functions
 
-Black box functions represent domain logic too complex or algorithmic for the spec level. They appear in expressions and their behaviour is described by comments or deferred specifications.
+Use pure helper functions to represent complex logic without expanding internals.
 
+```clojure
+(defn interviewer-matching-suggest [_db _request]
+  ;; Deferred detailed model; returns candidate interviewer ids.
+  #{:i-1 :i-3})
 ```
-hash(password)                              -- black box
-verify(password, user.password_hash)        -- black box
-parse_mentions(body)                        -- black box: extracts @username
-next_digest_time(user)                      -- black box: uses digest_day_of_week
-```
-
-Black box functions are pure (no side effects) and deterministic for the same inputs within a rule execution.
 
 ### The `with` and `where` keywords
 
-`with` declares how entities are connected. `where` selects from those connections.
+Recife has no special `with`/`where` syntax. Use Clojure `let`, `filter`, and helper functions.
 
-A relationship declaration says "these are the InterviewSlots that belong to this Candidacy". A projection says "of those slots, show me the confirmed ones":
-
+```clojure
+(let [confirmed (filter (fn [[_ slot]] (= :confirmed (:status slot))) slots)]
+  (into #{} (map first confirmed)))
 ```
--- Relationship: declares which InterviewSlots belong to this Candidacy
-slots: InterviewSlot with candidacy = this
-
--- Projection: of those slots, keep the confirmed ones
-confirmed_slots: slots where status = confirmed
-```
-
-Because `with` defines a relationship from the universe of all instances, it needs `this` as an anchor — the predicate must reference the enclosing entity to establish the link. Because `where` filters an already-scoped collection, `this` would be meaningless and must not appear.
-
-- **`with`** appears in relationship declarations. The predicate defines the structural link and must reference `this`.
-- **`where`** appears in projections, iteration, surface context, actor identification and surface `let` bindings. The predicate filters an existing collection and must not reference `this`.
-
-```
--- Surface context (where)
-context assignment: SlotConfirmation where interviewer = viewer
-
--- Actor identification (where)
-User where role = admin
-
--- Iteration (where)
-for user in Users where notification_setting.digest_enabled:
-
--- Surface let binding (where)
-let comments = Comments where parent = parent and status = active
-```
-
-Both `with` and `where` predicates support the same expression language as `requires` clauses: field navigation (including chained), comparisons, arithmetic, boolean combinators (`and`, `or`, `not`), bare boolean expressions and `in` for set membership. `where notification_setting.digest_enabled` and `where notification_setting.digest_enabled = true` are equivalent.
 
 ### Entity collections
 
-The pluralised type name refers to all instances of that entity:
+Entity collections are usually maps keyed by ids.
 
+```clojure
+(def global
+  {::users {:u-1 {:status :active}
+            :u-2 {:status :locked}}
+   ::subscriptions {:s-1 {:user-id :u-1 :status :active}}})
 ```
-for user in Users where notification_setting.digest_enabled:
-    ...
-```
-
-`Users` means all instances of `User`. Use natural English plurals: `Users`, `Documents`, `Workspaces`, `Candidacies`.
-
-Entity collections are typically used in rule-level `for` clauses and surface `let` bindings to iterate or filter across all instances of a type.
 
 ---
 
 ## Deferred specifications
 
-Reference detailed specifications defined elsewhere:
+Deferred logic should be represented as explicit placeholders and linked to dedicated model files.
 
-```
-deferred InterviewerMatching.suggest    -- see: detailed/interviewer-matching.allium
-deferred SlotRecovery.initiate          -- see: slot-recovery.allium
-```
-
-This allows the main specification to remain succinct while acknowledging that detail exists elsewhere.
-
-Deferred specifications are invoked at call sites using dot notation. They can appear as standalone ensures clauses or as expressions that return a value:
-
-```
--- Standalone invocation (the deferred spec handles the outcome)
-ensures: InterviewerMatching.suggest(candidacy)
-
--- Expression usage (the deferred spec returns a value)
-ensures: OnCallPaged(team: EscalationPolicy.at_level(level), priority: immediate)
+```clojure
+(defn escalation-policy-at-level
+  [_db _level]
+  ;; see: detailed/escalation_policy.clj
+  (throw (ex-info "Deferred model component" {})))
 ```
 
-Unlike black box functions, which model opaque external computations, deferred specifications represent Allium logic that is fully specified elsewhere. The deferred declaration signals that the detail exists and is maintained separately.
-
----
+Unlike opaque helper functions, deferred model components are expected to exist as separate model modules and be versioned with the main model.
 
 ## Open questions
 
-Capture unresolved design decisions:
+Track unresolved decisions close to the model.
 
+```clojure
+(comment
+  "Open question: should support agents have read-only billing access?"
+  "Open question: trial conversion grace period duration")
 ```
-open question "Admin ownership - should admins be assigned to specific roles?"
-open question "Multiple interview types - how is type assigned to candidacy?"
-```
-
-Open questions are surfaced by the specification checker as warnings, indicating the spec is incomplete.
-
----
 
 ## Config
 
-A `config` block declares configurable parameters for the specification. Each parameter has a name, type and default value.
+Keep configurable parameters in explicit config maps.
 
-```
-config {
-    min_password_length: Integer = 12
-    max_login_attempts: Integer = 5
-    lockout_duration: Duration = 15.minutes
-    reset_token_expiry: Duration = 1.hour
-}
+```clojure
+(def global
+  {::config {:invitation-expiry-ms (* 7 24 60 60 1000)
+             :max-login-attempts 5
+             :digest-window-ms (* 24 60 60 1000)}})
 ```
 
-Rules reference config values with dot notation:
+Use config values in process guards and updates.
 
+```clojure
+(<= (+ created-at (get-in db [::config :invitation-expiry-ms])) now)
 ```
-requires: length(password) >= config.min_password_length
-ensures: token.expires_at = now + config.reset_token_expiry
-```
-
-External specs declare their own config blocks. Consuming specs configure them via the qualified name:
-
-```
-oauth/config {
-    session_duration: 8.hours
-    link_expiry: 15.minutes
-}
-```
-
-External config values are referenced as `oauth/config.session_duration`.
-
-For default entity instances (seed data, base configurations), use `default` declarations.
-
----
 
 ## Defaults
 
-Default declarations create named entity instances that exist unconditionally. They are available to all rules and surfaces without requiring creation by any rule.
+Model defaults are initial state values in `global`.
 
+```clojure
+(def global
+  {::roles {:viewer {:permissions #{:documents.read}}
+            :editor {:permissions #{:documents.read :documents.write}}}})
 ```
-default InterviewType all_in_one = { name: "All in one", duration: 75.minutes }
-
-default Role viewer = {
-    name: "viewer",
-    permissions: { "documents.read" }
-}
-
-default Role editor = {
-    name: "editor",
-    permissions: { "documents.write" },
-    inherits_from: viewer
-}
-```
-
----
 
 ## Modular specifications
 
+Recife models are composed with namespaces and required modules.
+
 ### Namespaces
 
-Namespaces are prefixes that organise names. Use qualified names to reference entities and triggers from other specs:
+```clojure
+(ns app.model.auth
+  (:require [recife.core :as r]
+            [recife.helpers :as rh]))
+```
 
-```
-entity Candidacy {
-    candidate: Candidate
-    authenticated_via: google-oauth/Session
-}
-```
+Use one namespace per cohesive model concern.
 
 ### Using other specs
 
-The `use` keyword brings in another spec with an alias:
+Compose models by requiring namespaces and including their components in `run-model`.
 
+```clojure
+(ns app.model.main
+  (:require [app.model.auth :as auth]
+            [app.model.billing :as billing]
+            [recife.core :as r]))
+
+(comment
+  @(r/run-model auth/global
+                #{auth/login-flow
+                  billing/subscription-flow
+                  auth/no-duplicate-sessions}))
 ```
-use "github.com/allium-specs/google-oauth/abc123def" as oauth
-use "github.com/allium-specs/feedback-collection/def456" as feedback
-
-entity Candidacy {
-    authenticated_via: oauth/Session
-    ...
-}
-```
-
-Coordinates are immutable references (git SHAs or content hashes), not version numbers. No version resolution algorithms, no lock files. A spec is immutable once published.
 
 ### Referencing external entities and triggers
 
-External specs' entities are used directly with qualified names:
+External boundaries are normalized queues or maps, then referenced by local processes.
 
-```
-rule RequestFeedback {
-    when: interview: Interview.slot.time.start + 5.minutes <= now
-    ensures: feedback/Request.created(
-        subject: interview,
-        respondents: interview.interviewers,
-        deadline: 24.hours
-    )
-}
+```clojure
+(def global
+  {:stripe/events #{}
+   ::subscriptions {}})
+
+(r/defproc apply-stripe-event
+  (fn [{:keys [:stripe/events] :as db}]
+    ...))
 ```
 
 ### Responding to external triggers
 
-Any trigger or state transition from another spec can be responded to. No extension points need to be declared:
+Use inbound queues and deterministic consumption patterns.
 
-```
-rule AuditLogin {
-    when: oauth/SessionCreated(session)
-    ensures: AuditLog.created(event: login, user: session.user)
-}
-
-rule NotifyOnFeedbackSubmitted {
-    when: feedback/Request.status transitions_to submitted
-    ensures:
-        for admin in Users where role = admin:
-            Notification.created(to: admin, template: feedback_received)
-}
+```clojure
+(r/defproc consume-webhook
+  (fn [{:keys [:webhook/events] :as db}]
+    (when-let [event (first events)]
+      (-> db
+          (update :webhook/events disj event)
+          (update :audit/log conj {:event event})))))
 ```
 
 ### Configuration
 
-Imported specs expose their own config parameters. Consuming specs set values via the qualified name:
-
-```
-use "github.com/allium-specs/google-oauth/abc123def" as oauth
-
-oauth/config {
-    session_duration: 8.hours
-    link_expiry: 15.minutes
-}
-```
-
-Reference external config values as `oauth/config.session_duration`. This uses the same `config` mechanism as local config blocks (see [Config](#config)).
+Each module may carry local config maps (`::config` key) or receive shared config in combined global state.
 
 ### Breaking changes
 
-Avoid breaking changes: accrete (add new fields, triggers, states; never remove or rename). If a breaking change is necessary, publish under a new name rather than a new version. Consumers update at their own pace; old coordinates remain valid forever.
+Treat model schema/key changes as breaking when:
+
+- component names change (`defproc`/check var names)
+- state key paths change (`::x` to `::y`)
+- event shapes change (`{:type ...}` structure)
+
+Provide migration notes and update composed runners.
 
 ### Local specs
 
-For specs within the same project, use relative paths:
-
-```
-use "./candidacy.allium" as candidacy
-use "./scheduling.allium" as scheduling
-```
-
-External entities in one spec may be internal entities in another. The boundary is determined by the `external` keyword, not by file location.
+Local modules should be normal Clojure files in the repo (`app/model/*.clj`) and referenced by namespace.
 
 ---
 
 ## Surfaces
 
-A surface defines a contract at a boundary. A boundary exists wherever two parties interact: a user and an application, a framework and its domain modules, a service and its consumers. Each surface names the boundary and specifies what each party exposes and provides.
+Recife has no dedicated `surface` keyword. Boundary contracts are represented with explicit state slices, operation queues and invariants.
 
-Surfaces serve two purposes:
-- **Documentation**: Capture expectations about what each party sees, must contribute and can use
-- **Test generation**: Generate tests that verify the implementation honours the contract
-
-Surfaces do not specify implementation details (database schemas, wire protocols, thread models, UI layout). They specify the behavioural contract both sides must honour.
+```clojure
+(def global
+  {::dashboard {:viewer-id :i-1
+                :visible-fields #{:slot :status}
+                :allowed-actions #{:confirm-slot}}
+   :ui/commands #{}})
+```
 
 ### Actor declarations
 
-When a surface has a specific external party, declare actor types:
+Actors are modeled as entities or role tags in state.
 
+```clojure
+(def global
+  {::users {:u-1 {:role :interviewer}
+            :u-2 {:role :admin}}})
+
+(defn actor-can-confirm-slot? [db user-id]
+  (= :interviewer (get-in db [::users user-id :role])))
 ```
-actor Interviewer {
-    identified_by: User where role = interviewer
-}
-
-actor Admin {
-    identified_by: User where role = admin
-}
-
-actor AuthenticatedUser {
-    identified_by: User where active_sessions.count > 0
-}
-```
-
-The `identified_by` expression specifies the entity type and condition that identifies the actor. It takes the form `EntityType where condition`, where the condition uses the entity's own fields, derived values and relationships. When an actor type is used in a `facing` clause, the binding variable has the entity type from the actor's `identified_by` expression. For example, `facing viewer: Interviewer` where `Interviewer` has `identified_by: User where role = interviewer` binds `viewer` as type `User`.
-
-When an actor's identity depends on a context that varies per surface, declare the expected context type with a `within` clause and reference it in `identified_by`:
-
-```
-actor WorkspaceAdmin {
-    within: Workspace
-    identified_by: User where WorkspaceMembership{user: this, workspace: within}.can_admin = true
-}
-```
-
-The `within` clause declares the entity type this actor requires from the surface's `context` binding. This makes the dependency explicit: the checker can verify that any surface using this actor provides a compatible context.
-
-Two keywords are available inside `identified_by`:
-
-- `this` — the entity instance being tested (here, the User). Same semantics as `this` in entity declarations.
-- `within` — the entity bound by the `context` clause of the surface that uses this actor, constrained to the type declared in the actor's `within` clause.
-
-```
-surface WorkspaceManagement {
-    facing admin: WorkspaceAdmin
-    context workspace: Workspace    -- matches WorkspaceAdmin's within: Workspace
-    ...
-}
-```
-
-An actor declaration with a `within` clause can only be used in surfaces that declare a `context` clause. The surface's context type must match the actor's declared `within` type.
-
-The `facing` clause accepts either an actor type or an entity type directly. Use actor declarations when the boundary has specific identity requirements (e.g., `WorkspaceAdmin` requires admin membership). Use entity types directly when any instance of that entity can interact (e.g., `facing visitor: User` for a public-facing surface). For integration surfaces where the external party is code rather than a person, declare an actor type with a minimal `identified_by` expression rather than leaving the type undeclared.
 
 ### Surface structure
 
-```
-surface SurfaceName {
-    facing party: ActorType
-    context item: EntityType [where predicate]
-    let binding = expression
+A practical surface contract in Recife usually includes:
 
-    exposes:
-        item.field [when condition]
-        ...
-
-    provides:
-        Action(party, item, ...) [when condition]
-        ...
-
-    guarantee: ConstraintName
-    guidance: -- non-normative advice
-
-    related:
-        OtherSurface(item.relationship) [when condition]
-        ...
-
-    timeout:
-        RuleName [when temporal_condition]
-}
-```
-
-Variable names (`party`, `item`) are user-chosen, not reserved keywords. All clauses are optional.
-
-| Clause | Purpose |
-|--------|---------|
-| `facing` | Who is on the other side of the boundary |
-| `context` | What entity or scope this surface applies to (one surface instance per matching entity; absent when no entity matches) |
-| `let` | Local bindings, same as in rules |
-| `exposes` | Visible data (supports `for` iteration over collections) |
-| `provides` | Available operations with optional when-guards (parameters are per-action inputs from the party) |
-| `guarantee` | Constraints that must hold across the boundary |
-| `guidance` | Non-normative implementation advice |
-| `related` | Associated surfaces reachable from this one; the parenthesised expression evaluates to the entity instance that the target surface's `context` clause binds to, and its type must match the target surface's context type |
-| `timeout` | References to temporal rules that apply within this surface's context (the rule name must correspond to a defined rule with a temporal trigger) |
+- visible data projection (`::dashboard` map)
+- allowed operations (`:allowed-actions`)
+- command queue for requested operations (`:ui/commands`)
+- invariants enforcing role-based visibility/permissions
 
 ### Examples
 
+```clojure
+(r/defproc confirm-slot
+  (fn [{:keys [::users :ui/commands ::slots] :as db}]
+    (when-let [{:keys [user-id slot-id]} (first commands)]
+      (if (= :interviewer (get-in users [user-id :role]))
+        (-> db
+            (update :ui/commands disj {:user-id user-id :slot-id slot-id})
+            (assoc-in [::slots slot-id :status] :confirmed))
+        db))))
+
+(rh/definvariant only-interviewer-confirms
+  [{:keys [::users ::slots :audit/confirmations]}]
+  (every? (fn [{:keys [user-id]}]
+            (= :interviewer (get-in users [user-id :role])))
+          confirmations))
 ```
-surface InterviewerPendingAssignments {
-    facing viewer: Interviewer
-
-    context assignment: InterviewAssignment
-        where interviewer = viewer and status = pending
-
-    exposes:
-        assignment.interview.scheduled_time
-        assignment.interview.candidate.name
-        assignment.interview.duration
-
-    provides:
-        InterviewerConfirmsAssignment(viewer, assignment)
-        InterviewerDeclinesAssignment(viewer, assignment, reason?)
-}
-```
-
-```
-surface InterviewerDashboard {
-    facing viewer: Interviewer
-
-    context assignment: SlotConfirmation where interviewer = viewer
-
-    exposes:
-        assignment.slot.time
-        assignment.slot.candidacy.candidate.name
-        assignment.status
-        assignment.slot.other_confirmations.interviewer.name
-
-    provides:
-        InterviewerConfirmsSlot(viewer, assignment.slot)
-            when assignment.status = pending
-        InterviewerDeclinesSlot(viewer, assignment.slot)
-            when assignment.status = pending
-
-    related:
-        InterviewDetail(assignment.slot.interview)
-            when assignment.slot.interview != null
-}
-```
-
-**Timeout example** — a `timeout` clause references an existing temporal rule by name and binds it to the surface's context. The rule name must correspond to a rule with a temporal trigger defined elsewhere in the spec. The `when` condition is optional: include it to restate the temporal expression for readability, or omit it when the rule name is self-explanatory. When present, the checker verifies the `when` condition matches the referenced rule's trigger.
-
-```
-surface InvitationView {
-    facing recipient: Candidate
-
-    context invitation: ResourceInvitation where email = recipient.email
-
-    exposes:
-        invitation.resource.name
-        invitation.is_valid
-
-    provides:
-        AcceptInvitation(invitation, recipient) when invitation.is_valid
-
-    timeout:
-        InvitationExpires when invitation.expires_at <= now
-}
-```
-
-The rule name alone is sufficient when the temporal condition is clear from the rule's name:
-
-```
-    timeout:
-        InvitationExpires
-```
-
-When the `when` condition is included, it serves as inline documentation. The checker verifies it matches the referenced rule's trigger, preventing drift between the surface and the rule.
 
 ---
 
 ## Validation rules
 
-A valid Allium specification must satisfy:
+A robust Recife model should satisfy:
 
-**Structural validity:**
-1. All referenced entities and values exist (internal, external or imported)
-2. All entity fields have defined types
-3. All relationships reference valid entities (singular names) and include a backreference to `this` in their `with` predicate. `with` is used for relationship declarations and must reference `this`; `where` is used for filtering (projections, iteration, surface context, actor identification, surface `let`) and must not reference `this`
-4. All rules have at least one trigger and at least one ensures clause
-5. All triggers are valid (external stimulus, state transition, state becomes, entity creation, temporal, derived or chained)
-6. All rules sharing a trigger name must use the same parameter count and positional types. Parameter binding names may differ between rules. Optional parameters (typed `T?`) may be omitted at call sites; omitted optional parameters bind to `null`
+1. Every `defproc` returns either `nil` (no transition) or a valid state map.
+2. Global keys are namespaced; local process keys are unnamespaced.
+3. Invariants hold across all reachable states.
+4. Temporal properties are meaningful and checkable.
+5. Event queues are consumed or intentionally retained.
+6. State transitions are monotonic where required by domain policy.
+7. Status/tag sets are constrained via invariants.
+8. No process depends on hidden mutable external state.
+9. Non-deterministic params (when used) are finite sets/colls or functions returning finite collections.
+10. Model time (`:clock/now`) is explicit in temporal logic.
 
-**State machine validity:**
-7. All status values are reachable via some rule
-8. All non-terminal status values have exits
-9. No undefined states: rules cannot set status to values not in the enum
+Recommended workflow:
 
-**Expression validity:**
-10. No circular dependencies in derived values
-11. All variables are bound before use
-12. Type consistency in comparisons and arithmetic
-13. All lambdas are explicit (use `i => i.field` not `field`)
-14. Inline enum fields cannot be compared with each other (whether on the same entity or across entities); use a named enum to share values across fields
-
-**Sum type validity:**
-15. Sum type discriminators use the pipe syntax with capitalised variant names (`A | B | C`)
-16. All names in a discriminator field must be declared as `variant X : BaseEntity`
-17. All variants that extend a base entity must be listed in that entity's discriminator field
-18. Variant-specific fields are only accessed within type guards (`requires:` or `if` branches)
-19. Base entities with sum type discriminators cannot be instantiated directly
-20. Discriminator field names are user-defined (e.g., `kind`, `node_type`), no reserved name
-21. The `variant` keyword is required for variant declarations
-
-**Given validity:**
-22. `given` bindings must reference entity types declared in the module or imported via `use`
-23. Each binding name must be unique within the `given` block
-24. Unqualified instance references in rules must resolve to a `given` binding, a `let` binding, a trigger parameter or a default entity instance
-
-**Config validity:**
-25. Config parameters must have explicit types and default values
-26. Config parameter names must be unique within the config block
-27. References to `config.field` in rules must correspond to a declared parameter in the local config block or a qualified external config (`alias/config.field`)
-
-**Surface validity:**
-28. Types in `facing` clauses must be either a declared `actor` type or a valid entity type (internal, external or imported)
-29. All fields referenced in `exposes` must be reachable from bindings declared in the surface (`facing`, `context`, `let`), via relationships, or be declared types from imported specifications
-30. All triggers referenced in `provides` must be defined as external stimulus triggers in rules
-31. All surfaces referenced in `related` must be defined, and the type of the parenthesised expression must match the target surface's `context` type
-32. Bindings in `facing` and `context` clauses must be used consistently throughout the surface
-33. `when` conditions must reference valid fields reachable from the party or context bindings
-34. `for` iterations must iterate over collection-typed fields or bindings and are valid in block scopes that produce per-item content (`exposes`, `provides`, `related`)
-35. Rule names referenced in `timeout` clauses must correspond to a defined rule with a temporal trigger. If a `when` condition is present, it must match the referenced rule's temporal trigger expression
-
-The checker should warn (but not error) on:
-- External entities without known governing specification
-- Open questions
-- Deferred specifications without location hints
-- Unused entities or fields
-- Rules that can never fire (preconditions always false)
-- Temporal rules without guards against re-firing
-- Surfaces that reference fields not used by any rule (may indicate dead code)
-- Items in `provides` with `when` conditions that can never be true
-- Actor declarations that are never used in any surface
-- Rules whose ensures creates an entity for a parent, where sibling rules on the same parent don't guard against that entity's existence
-- Surface `provides` when-guards weaker than the corresponding rule's requires
-- Rules with the same trigger and overlapping preconditions (spec ambiguity)
-- Parameterised derived values that reference fields outside the entity (scoping violation)
-- Actor `identified_by` expressions that are trivially always-true or always-false
-- Rules where all ensures clauses are conditional and at least one execution path produces no effects
-- Temporal triggers on optional fields (trigger will not fire when the field is null)
-- Surfaces that use a raw entity type in `facing` when actor declarations exist for that entity type (may indicate a missing access restriction)
-- `transitions_to` triggers on values that entities can be created with (the rule will not fire on creation; consider `becomes` if the rule should also fire on creation)
-- Multiple fields on the same entity with identical inline enum literals (suggests extraction to a named enum; will error if the fields are later compared)
+```clojure
+(comment
+  (def components #{process-a process-b invariant-a property-a})
+  (def result @(r/run-model global components {:workers 4}))
+  result)
+```
 
 ---
 
 ## Anti-patterns
 
-**Implementation leakage:**
-```
--- Bad
-let request = FeedbackRequest.find(interview_id, interviewer_id)
+Avoid:
 
--- Good
-let request = FeedbackRequest{interview, interviewer}
-```
+- embedding HTTP/database framework details in model state semantics
+- using model keys that mirror table/ORM internals without domain meaning
+- hiding important transitions inside opaque helper calls with no checks
+- overloading one process with unrelated responsibilities
+- adding non-determinism that is infinite or not controlled
+- using unbounded collections without constraining behavior via invariants/properties
+- mixing command representation formats in one queue
+- writing checks that merely restate code mechanics instead of domain guarantees
 
-**UI/UX in spec:**
-```
--- Bad
-ensures: Button.displayed(label: "Confirm", onClick: ...)
+Prefer:
 
--- Good
-ensures: CandidateInformed(about: options_available, data: { slots: slots })
-```
-
-**Algorithm in rules:**
-```
--- Bad
-ensures: selected = interviewers.sortBy(load).take(3).filter(available)
-
--- Good
-ensures: Suggestion.created(
-    interviewers: InterviewerMatching.suggest(considering: [...])
-)
-```
-
-**Queries in rules:**
-```
--- Bad
-let pending = SlotConfirmation.where(slot: slot, status: pending)
-
--- Good
-let pending = slot.pending_confirmations
-```
-
-**Implicit shorthand in lambdas:**
-```
--- Bad
-interviewers.any(can_solo)
-
--- Good
-interviewers.any(i => i.can_solo)
-```
-
-**Missing temporal guards:**
-```
--- Bad: can fire repeatedly
-rule InvitationExpires {
-    when: invitation: Invitation.expires_at <= now
-    ensures: invitation.status = expired
-}
-
--- Good: guard prevents re-firing
-rule InvitationExpires {
-    when: invitation: Invitation.expires_at <= now
-    requires: invitation.status = pending
-    ensures: invitation.status = expired
-}
-```
-
-**Overly broad status enums:**
-```
--- Bad
-status: draft | pending | active | paused | resumed | completed |
-        cancelled | expired | archived | deleted
-
--- Good
-status: pending | active | completed | cancelled
-is_archived: Boolean
-```
-
-**`transitions_to` doesn't fire on creation:**
-```
--- Bad: won't fire when Interview is created with status = scheduled
-rule NotifyOnScheduled {
-    when: interview: Interview.status transitions_to scheduled
-    ensures: Email.created(to: interview.candidate.email, template: interview_scheduled)
-}
-
--- Good: use becomes when the rule should fire regardless of how the state was reached
-rule NotifyOnScheduled {
-    when: interview: Interview.status becomes scheduled
-    ensures: Email.created(to: interview.candidate.email, template: interview_scheduled)
-}
-
--- Also good: handle creation and transition separately when the response differs
-rule NotifyOnRescheduled {
-    when: interview: Interview.status transitions_to scheduled
-    ensures: Email.created(to: interview.candidate.email, template: interview_rescheduled)
-}
-
-rule NotifyOnCreatedScheduled {
-    when: interview: Interview.created
-    requires: interview.status = scheduled
-    ensures: Email.created(to: interview.candidate.email, template: interview_scheduled)
-}
-```
-
-**Magic numbers in rules:**
-```
--- Bad
-requires: attempts < 3
-ensures: deadline = now + 48.hours
-
--- Good
-requires: attempts < config.max_attempts
-ensures: deadline = now + config.confirmation_deadline
-```
+- small composable processes
+- explicit event queues
+- explicit invariants for safety
+- explicit temporal properties for liveness
+- clear namespace/module boundaries
 
 ---
 
 ## Glossary
 
-| Term | Definition |
-|------|------------|
-| **Given (module)** | Entity instances a module operates on, declared with `given { ... }`; inherited by all rules in the module. Binds singleton instances at module scope. Contrast with **Context**, which is parametric |
-| **Context (surface)** | Parametric scope binding for a boundary contract, declared with `context` inside a surface. Creates one surface instance per matching entity. Contrast with **Given**, which binds singleton instances at module scope |
-| **Entity** | A domain concept with identity and lifecycle |
-| **Value** | Structured data without identity, compared by structure |
-| **Sum Type** | Entity constrained to exactly one of several variants via a discriminator field |
-| **Discriminator** | Field whose pipe-separated capitalised values name the variants |
-| **Variant** | One alternative in a sum type, declared with `variant X : Base { ... }` |
-| **Type Guard** | Condition (`requires:` or `if`) that narrows to a variant, unlocking its fields |
-| **Field** | Data stored on an entity or value |
-| **Relationship** | Navigation from one entity to related entities |
-| **Projection** | A filtered view of a relationship |
-| **Derived Value** | A computed value based on other fields |
-| **Parameterised Derived Value** | A derived value that takes arguments, e.g. `can_use_feature(f): f in plan.features` |
-| **Rule** | A specification of behaviour triggered by some condition |
-| **Trigger** | The condition that causes a rule to fire |
-| **Trigger Emission** | An ensures clause that emits a named event; other rules chain from it via their `when` clause |
-| **Precondition** | A requirement that must be true for a rule to execute |
-| **Postcondition** | An assertion about what becomes true after a rule executes |
-| **Black Box Function** | Domain logic referenced but not defined in the spec; pure and deterministic |
-| **External Entity** | An entity managed by another specification; referenced but not governed here |
-| **Config** | Configurable parameters for a specification, referenced via `config.field` |
-| **Default** | A named entity instance used as seed data or base configuration |
-| **Deferred Specification** | Complex logic defined in a separate file |
-| **Open Question** | An unresolved design decision |
-| **Entity Collection** | Pluralised type name referring to all instances of that entity (e.g., `Users` for all `User` instances) |
-| **Exists** | Keyword for checking entity existence (`exists x`) or asserting removal (`not exists x`) |
-| **`within`** | Clause in actor declarations that names the required context type; also a keyword in `identified_by` expressions that resolves to the surface's context entity |
-| **`this`** | The instance of the enclosing type; valid in entity declarations and actor `identified_by` expressions |
-| **Enum** | A set of values. **Named enums** (`enum Recommendation { ... }`) have type identity and are reusable across fields and entities. **Inline enums** (`status: pending \| active`) are anonymous, scoped to a single field, and cannot be compared across fields |
-| **Discard Binding** | `_` used where a binding is syntactically required but the value is not needed |
-| **Actor** | An entity type that can interact with surfaces, declared with explicit identity mapping |
-| **`facing`** | Surface clause naming the external party on the other side of the boundary |
-| **Surface** | A boundary contract between two parties specifying what each side exposes and provides |
+- **Model state**: the map processed by Recife (`db`), containing global and local process data.
+- **Process (`defproc`)**: a transition producer; returns next state or `nil`.
+- **Step map**: multi-step process definition keyed by step ids, using `:pc` and `r/goto`/`r/done`.
+- **Invariant**: safety property that must always hold (`rh/definvariant`).
+- **Temporal property**: liveness/temporal expectation (`rh/defproperty`).
+- **Action property**: relation between consecutive states (`rh/defaction-property`).
+- **Fairness**: scheduling assumptions for process execution (`rh/deffairness` or `^:fair`).
+- **Global key**: namespaced keyword persisted in global model state.
+- **Local key**: unnamespaced keyword scoped to process instance local state.
+- **Command queue**: collection of requested external actions/events consumed by processes.
+- **Projection**: helper-derived view over entity collections.
+- **Deferred model**: referenced logic modeled in another file/module.

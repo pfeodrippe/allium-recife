@@ -1,49 +1,46 @@
 # Test generation
 
-From an Allium specification, generate:
+From a Recife model (`.clj`), generate:
 
-**Contract tests** (per rule):
-- Success case: all preconditions met, verify all postconditions hold
-- Failure cases: one test per precondition, verify rule is rejected when that precondition fails
-- Edge cases: boundary values for numeric conditions
+**Process transition tests** (per `defproc`):
+- Success case: guard conditions hold, verify expected state transition
+- Failure cases: one test per guard clause, verify no transition (`nil` or unchanged state)
+- Edge cases: boundary values for time, counts and quotas
 
-**State transition tests** (per entity with status):
-- Valid transitions succeed via their rules
-- Invalid transitions are rejected (no rule allows them)
+**State transition tests** (per entity/status map):
+- Valid transitions succeed via process steps
+- Invalid transitions are rejected (guards fail)
 - Terminal states have no outbound transitions
 
-**Temporal tests** (per time-based trigger):
-- Before deadline: rule doesn't fire, state unchanged
-- At deadline: rule fires, postconditions hold
-- After deadline: rule has already fired, doesn't re-fire
+**Temporal tests** (per time-based process/property):
+- Before deadline: no transition
+- At deadline: transition fires and updates state
+- After deadline: idempotent behavior (no duplicate effect)
 
-**Communication tests** (per Notification/Email/etc):
-- Verify communication is triggered
-- Verify recipient is correct
-- Verify template and data are passed
+**Communication/event tests** (per outbox queue):
+- Verify event is emitted
+- Verify recipient/target is correct
+- Verify payload shape is complete
 
 **Scenario tests** (per flow):
 - Happy path through main flow
 - Edge cases and error paths
-- Concurrent scenarios: what happens if two triggers fire simultaneously?
+- Concurrent scenarios: process interleavings still satisfy invariants
 
-**Sum type tests** (per sum type):
-- Type discrimination: verify each variant has distinct accessible fields
-- Exhaustiveness: verify all variants are handled in conditional logic
-- Invalid state prevention: verify that an entity cannot be multiple variants
-- Type guard correctness: verify variant-specific fields are only accessible within appropriate type guards
+**Tagged-state (sum-type-by-convention) tests**:
+- Tag discrimination (`:kind`/`:type`) routes logic to correct branch
+- Exhaustiveness in `case`/`cond`
+- Invalid tag values are blocked by invariants
 
-**Surface tests** (per surface):
-- Exposure tests: verify each item in `exposes` is accessible to the specified party
-- Provides availability tests: verify provided operations appear when their `when` conditions are true
-- Provides unavailability tests: verify provided operations are hidden when `when` conditions are false
-- Requires tests: verify the surface rejects interaction when required contributions are missing
-- Related surface navigation: verify navigation to related surfaces works
-- Party restriction tests: verify the surface is not accessible to other party types
-- Guarantee tests: verify stated guarantees hold across the boundary
+**Boundary contract tests** (surface-equivalent state slices):
+- Visibility tests for exposed fields
+- Operation availability by role/scope
+- Rejection tests when preconditions are missing
+- Navigation/relationship consistency tests
 
-**Cross-rule interaction tests** (per rule with entity-creating ensures):
-- Re-trigger sibling rules on the same parent while the created entity exists. Verify guards prevent duplicate creation or conflicting state.
-- For each surface `provides` entry, generate unavailability tests for each conjunct in the corresponding rule's requires. One test per conjunct, each falsifying that conjunct, verifying the operation is hidden or rejected.
+**Cross-process interaction tests**:
+- Re-trigger sibling processes while dependent state exists
+- Verify guards prevent duplicate creation/conflicting state
+- Verify command queues are consumed deterministically
 
-**Concurrency note:** Rules are assumed to be atomic, meaning a rule either completes entirely or not at all. If two rules could fire simultaneously on the same entity, test that the resulting state is consistent regardless of order.
+**Concurrency note:** Recife process transitions are atomic per step. If two processes can apply on the same state, test both interleavings and verify invariants/properties still hold.

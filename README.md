@@ -1,267 +1,269 @@
-# Allium
+# Recife
 
-*Velocity through clarity*
+*Velocity through executable clarity*
 
 ---
 
-A language for sharpening intent alongside implementation. [juxt.github.io/allium](https://juxt.github.io/allium/)
+A Clojure model checking workflow for sharpening intent alongside implementation.
 
 ## Get started
 
-**Claude Code** (via the JUXT plugin marketplace):
+**Claude Code** (via plugin marketplace):
 
 ```
 /plugin marketplace add juxt/claude-plugins
-/plugin install allium
+/plugin install recife
 ```
 
-**Cursor, Windsurf, Copilot, Aider, Continue and 40+ other tools:**
+**Cursor, Windsurf, Copilot, Aider, Continue and other tools:**
 
 ```
-npx skills add juxt/allium
+npx skills add pfeodrippe/recife-skill
 ```
 
-Once installed, type `/allium` to get started. Allium examines your project and offers to distill from existing code or build a new spec through conversation. You can also jump straight to a specific mode:
+Once installed, type `/recife` to get started. The skill examines your project and offers to distill from existing code or build a new model through conversation. You can also jump straight to a specific mode:
 
-- `/allium:elicit` — build a spec through structured conversation with stakeholders
-- `/allium:distill` — extract a spec from existing code
+- `/recife:elicit` — build a model through structured conversation with stakeholders
+- `/recife:distill` — extract a model from existing code
 
-Jump to what [Allium looks like in practice](#what-this-looks-like-in-practice).
+Jump to what [Recife looks like in practice](#what-this-looks-like-in-practice).
 
 ## The problem with conversational context
 
 - Within a session, meaning drifts: by prompt ten or twenty, the model is pattern-matching on its own outputs rather than the original intent.
 - Across sessions, knowledge evaporates: assumptions and constraints disappear when the chat ends.
 
-Allium gives behavioural intent a durable form that doesn't drift with the conversation and persists across sessions.
+Recife gives behavioural intent a durable, executable form that does not drift with the conversation and persists across sessions.
 
 ## Why not just point the LLM at the code?
 
-Modern LLMs navigate codebases effectively, and many engineers find this sufficient. The limitation appears when you need to distinguish what the code *does* from what it *should do*. Code captures implementation, including bugs and expedient decisions. The model treats all of it as intended behaviour.
+Modern LLMs navigate codebases effectively. The limitation appears when you need to distinguish what the code *does* from what it *should do*. Code captures implementation, including bugs and expedient decisions. The model treats all of it as intended behaviour.
 
-Precise prompting helps, but precise prompting means specifying intent: which behaviours are deliberate, which constraints must be preserved. You end up writing descriptions of intent distributed across your prompts. Allium captures this in a form that persists. The next engineer, or the next model, or you next week, can understand not just what the system does but what it was meant to do.
+Precise prompting helps, but precise prompting still means specifying intent: which behaviours are deliberate, which constraints must be preserved. You end up writing descriptions of intent distributed across prompts. Recife captures this intent as executable models and checks.
 
 ## Why not capture requirements in markdown?
 
-Markdown provides no framework for surfacing ambiguities and contradictions. You can write "users must be authenticated" in one section and "guest checkout is supported" in another without the format highlighting the tension. Capable models may resolve such ambiguities silently in ways you didn't intend; weaker models may not recognise that alternatives existed.
+Markdown provides no machinery for checking contradictions over state transitions. You can write “users must be authenticated” in one section and “guest checkout is supported” in another without the format highlighting tension.
 
-Allium's structure makes contradictions visible. When two rules have incompatible preconditions, the formal syntax exposes the conflict. The model doesn't need to be clever enough to spot the issue in prose; the structure does that work. Markdown can capture robust behaviour with sufficient diligence, but that diligence falls entirely on the author. Allium's constraints guide you toward completeness and consistency.
+Recife models make those contradictions checkable via invariants, action properties and temporal properties. You do not rely on prose interpretation alone.
 
 ## Iterating on specifications
 
-The specification and the code evolve together. Writing and refining a behavioural model alongside implementation sharpens your understanding of both the problem and your solution. Questions surface that you wouldn't have thought to ask; constraints emerge that only become visible when you try to formalise them.
+The model and the code evolve together. Writing and refining behavioural models alongside implementation sharpens understanding of both the problem and the solution.
 
-Manual coding embedded this discovery in the act of implementation. LLMs generate code from descriptions, shifting where design thinking occurs. Allium captures it explicitly: the specification becomes the site of that thinking, the code its expression.
+Two processes feed this growth: **elicitation** works forward from intent through structured conversations with stakeholders, while **distillation** works backward from implementation to capture what the system actually does, including behaviour never explicitly decided.
 
-Two processes feed this growth: **elicitation** works forward from intent through structured conversations with stakeholders, while **distillation** works backward from implementation to capture what the system actually does, including behaviours that were never explicitly decided. Distillation reveals what you built; elicitation clarifies what you meant. When these diverge, you've found something worth investigating.
-
-See the [elicitation guide](skills/elicit/SKILL.md) and the [distillation guide](skills/distill/SKILL.md) for detailed approaches.
+See the [elicitation guide](skills/elicit/SKILL.md) and the [distillation guide](skills/distill/SKILL.md).
 
 ## On single sources of truth
 
-A common objection is that maintaining behavioural models alongside code violates the single source of truth principle. But code captures both intentional and accidental behaviour, with no mechanism to distinguish them. Is that authentication quirk a feature or a bug? The code can't tell you. You need something outside the code to even articulate "this behaviour is wrong". Engineers already accept this in other contexts: type systems express intent that code must satisfy, tests assert expected behaviour against actual behaviour. These aren't duplication.
+A common objection is that maintaining behavioural models alongside code violates single-source-of-truth principles. In practice, code captures both intentional and accidental behaviour. You still need an explicit behavioural layer to state what should hold.
 
-Allium applies the same pattern. Code excels at expressing *how*; behavioural models excel at expressing *what* and *under which conditions*. When these disagree, that disagreement is information. Perhaps the implementation drifted from intent, or perhaps the model was naive. Either might need to change. The gap between them surfaces questions you need to answer. Redundancy, in this context, isn't overhead. It's resilience.
+Recife applies the same pattern as tests and type systems: code expresses *how*; models and properties express *what must always hold* and *what must eventually happen*.
 
-## What Allium captures
+## What Recife captures
 
-Allium provides a minimal syntax for describing events with their preconditions and the outcomes that result. The language deliberately excludes implementation details such as database schemas and API designs, focusing purely on observable behaviour.
+Recife provides executable Clojure syntax for describing transitions, constraints and temporal expectations.
 
-```allium
-rule RequestPasswordReset {
-    when: UserRequestsPasswordReset(email)
+```clojure
+(ns model.password-reset
+  (:require [recife.core :as r]
+            [recife.helpers :as rh]))
 
-    let user = User{email}
+(def global
+  {::users {:u-1 {:email "ana@example.com"
+                  :status :active
+                  :pending-reset-tokens #{:t-1}}}
+   ::reset-tokens {:t-1 {:user-id :u-1 :status :pending}}
+   :mail/outbox []
+   ::config {:reset-token-expiry-ms (* 24 60 60 1000)}})
 
-    requires: exists user
-    requires: user.status in {active, locked}
+(r/defproc request-password-reset
+  {[:request-password-reset {:email #(-> % ::users vals (map :email) set)}]
+   (fn [{:keys [:email ::users ::reset-tokens ::config] :as db}]
+     (when-let [[user-id user] (first (filter (fn [[_ u]] (= email (:email u))) users))]
+       (when (contains? #{:active :locked} (:status user))
+         (let [token-id (keyword (str "t-" (inc (count reset-tokens))))]
+           (-> db
+               (update-in [::users user-id :pending-reset-tokens] conj token-id)
+               (assoc-in [::reset-tokens token-id]
+                         {:user-id user-id
+                          :status :pending
+                          :expires-at (+ (System/currentTimeMillis)
+                                         (:reset-token-expiry-ms config))})
+               (update :mail/outbox conj {:to (:email user)
+                                          :template :password-reset
+                                          :token-id token-id}))))))})
 
-    ensures:
-        for t in user.pending_reset_tokens:
-            t.status = expired
-    ensures:
-        let token = PasswordResetToken.created(
-            user: user,
-            created_at: now,
-            expires_at: now + config.reset_token_expiry,
-            status: pending
-        )
-        Email.created(
-            to: user.email,
-            template: password_reset,
-            data: { token: token }
-        )
-}
+(rh/definvariant reset-only-for-known-users
+  [{:keys [::reset-tokens ::users]}]
+  (every? (fn [[_ {:keys [user-id]}]]
+            (contains? users user-id))
+          reset-tokens))
 ```
 
-This rule captures observable behaviour: when a password reset is requested, if the email matches an active or locked account, existing tokens are invalidated, a new token is created and an email is sent. It says nothing about which database stores the token or which service sends the email, because those decisions belong to implementation.
+This model captures observable behaviour without encoding database or transport details.
 
-The same syntax works whether you're capturing infrastructure contracts or operational policy. A circuit breaker specification describes behaviour that typically lives in library defaults, Grafana alerts and architecture docs, never in any formal specification:
+The same syntax works for operational policy and reliability controls:
 
-```allium
-entity CircuitBreaker {
-    service: ExternalService
-    status: closed | open | half_open
-    opened_at: Timestamp?
-    failures: Failure with circuit_breaker = this
-    recent_failures: failures with occurred_at > now - config.failure_window
-    failure_rate: recent_failures.count / config.window_sample_size
-    is_tripped: failure_rate >= config.failure_threshold
-}
+```clojure
+(ns model.circuit-breaker
+  (:require [recife.core :as r]
+            [recife.helpers :as rh]))
 
-config {
-    failure_threshold: Decimal = 0.5
-    failure_window: Duration = 30.seconds
-    window_sample_size: Integer = 20
-    recovery_timeout: Duration = 10.seconds
-}
+(def global
+  {::circuit {:status :closed
+              :opened-at nil
+              :recent-failures 0}
+   ::config {:failure-threshold 10
+             :recovery-timeout-ms 10000}
+   :clock/now 0})
 
-rule CircuitOpens {
-    when: circuit_breaker: CircuitBreaker.is_tripped
-    requires: circuit_breaker.status = closed
+(r/defproc register-failure
+  (fn [{:keys [::circuit ::config] :as db}]
+    (let [failures (inc (:recent-failures circuit))]
+      (if (>= failures (:failure-threshold config))
+        (-> db
+            (assoc-in [::circuit :recent-failures] failures)
+            (assoc-in [::circuit :status] :open)
+            (assoc-in [::circuit :opened-at] (:clock/now db)))
+        (assoc-in db [::circuit :recent-failures] failures)))))
 
-    ensures:
-        circuit_breaker.status = open
-        circuit_breaker.opened_at = now
-}
+(r/defproc probe-circuit
+  (fn [{:keys [::circuit ::config :clock/now] :as db}]
+    (when (and (= :open (:status circuit))
+               (<= (+ (:opened-at circuit)
+                      (:recovery-timeout-ms config))
+                   now))
+      (assoc-in db [::circuit :status] :half-open))))
 
-rule CircuitProbes {
-    when: circuit_breaker: CircuitBreaker.opened_at + config.recovery_timeout <= now
-    requires: circuit_breaker.status = open
-
-    ensures: circuit_breaker.status = half_open
-}
+(rh/definvariant valid-circuit-status
+  [{:keys [::circuit]}]
+  (contains? #{:closed :open :half-open} (:status circuit)))
 ```
 
-At the other end, an incident escalation rule captures operational policy that otherwise lives in runbooks, PagerDuty config and tribal knowledge, where drift between intent and implementation causes real damage:
+```clojure
+(ns model.incident-escalation
+  (:require [recife.core :as r]
+            [recife.helpers :as rh]))
 
-```allium
-config {
-    exec_notify_threshold: Integer = 2
-}
+(def global
+  {::incident {:status :investigating
+               :declared-at 0
+               :sla-target-ms 300000
+               :escalation-level 0}
+   ::config {:exec-notify-threshold 2}
+   :clock/now 0
+   :pager/requests []
+   :exec/briefings []})
 
-deferred EscalationPolicy.at_level
+(r/defproc escalate-incident
+  (fn [{:keys [::incident ::config :clock/now] :as db}]
+    (when (and (contains? #{:open :investigating} (:status incident))
+               (<= (+ (:declared-at incident) (:sla-target-ms incident)) now))
+      (let [level (inc (:escalation-level incident))]
+        (cond-> (-> db
+                    (assoc-in [::incident :escalation-level] level)
+                    (update :pager/requests conj {:level level :priority :immediate}))
+          (>= level (:exec-notify-threshold config))
+          (update :exec/briefings conj {:incident :primary :level level}))))))
 
-rule IncidentEscalates {
-    when: incident: Incident.declared_at + incident.sla_target <= now
-    requires: incident.status in {open, investigating}
-
-    ensures:
-        incident.escalation_level = incident.escalation_level + 1
-        OnCallPaged(
-            team: EscalationPolicy.at_level(incident.escalation_level),
-            priority: immediate
-        )
-        if incident.escalation_level >= config.exec_notify_threshold:
-            ExecBriefingSent(incident: incident)
-}
+(rh/defproperty escalation-eventually-stabilizes
+  [{:keys [::incident]}]
+  (rh/eventually
+   (rh/always
+    (<= (:escalation-level incident) 5))))
 ```
 
-The [language reference](references/language-reference.md) covers entities, rules, triggers, relationships, projections, derived values, surfaces and actor declarations.
+The [language reference](references/language-reference.md) covers processes, non-determinism, invariants, temporal properties, fairness and model composition.
 
-### A language without a runtime
+### A language with an executable checker
 
-Allium has no compiler and no runtime. It is purely descriptive, defined entirely by its documentation.
-
-In an era where LLMs function as pseudocode compilers, executing informal descriptions into working code, a well-structured behavioural language becomes the mechanism for ensuring that what gets compiled is what you actually meant. The behavioural model is the primary artefact; the code that implements it is secondary.
+Recife is not just descriptive. It runs models and checks properties. In an LLM workflow, this gives an explicit behavioural artifact that can be validated continuously instead of remaining an unverified narrative.
 
 ## What this looks like in practice
 
-### Allium surfaces implications you missed
+### Recife surfaces implications you missed
 
-A customer's account was suspended for a terms of service violation. They've appealed and the team wants to let them back in.
-
----
-
-> ***> A customer says they can't reset their password. Their account was suspended last month but they've appealed and we want to let them back in. Can you enable password reset for suspended users?***
->
-> ✻ Your Allium requires `user.status in {active, locked}` for password resets. This user's status is `suspended`, so the reset is blocked by design. Reactivating through password reset would bypass your `AccountReinstated` rule, which requires admin approval and logs an audit trail.
->
-> ✻ Should we reinstate the account through the existing admin flow first, then let them reset their password? Or create a new `AccountReinstatedViaAppeal` rule that combines both steps with the audit trail intact?
->
-> ***> Reinstate through the admin flow first. The audit trail matters.***
+A customer account was suspended for a policy violation. The team asks to allow password resets anyway.
 
 ---
 
-Without Allium, the LLM would have relaxed the status check, accidentally creating a backdoor around an admin control. The behavioural model caught that password reset and account reinstatement are separate concerns with different approval requirements.
+> ***> Can you enable password reset for suspended users?***
+>
+> ✻ Your Recife model only allows resets for statuses `:active` and `:locked`. Enabling `:suspended` would bypass the reinstatement flow currently captured as a separate transition.
+>
+> ✻ Do we want to reinstate through admin approval first, then allow reset, so the audit step remains required?
+>
+> ***> Yes, keep admin reinstatement mandatory.***
+
+---
+
+Without a model, the assistant might relax checks in a way that bypasses controls.
 
 ### Knowledge persists across sessions
 
-A developer starts a new session days later, working on a different feature.
+A developer returns days later to add a free trial.
 
 ---
 
-> ***> Add a free trial. New subscribers get their first month at no charge.***
+> ***> Add a free first month for new subscriptions.***
 >
-> ✻ Your Allium has a constraint here. `SubscriptionCreated` ensures a payment is processed and `InvoiceGenerated` requires `invoice.amount > 0`. A free first month would need to bypass both.
+> ✻ Your model currently requires payment capture before `:subscription-active`. A free month needs either a zero-value invoice path or a trial status with explicit conversion rules.
 >
-> ✻ Should the trial skip invoice generation entirely, or create a zero-value invoice for the audit trail? And should the `PaymentMethod` still be captured upfront, or only when the trial converts?
+> ✻ Should trial activation still collect payment method upfront?
 >
-> ***> Create a zero-value invoice and capture the payment method upfront.***
+> ***> Yes, capture payment method upfront and emit a zero-value invoice.***
 
 ---
 
-The developer never mentioned invoicing or payment method capture. The Allium did, from a session that ended days ago. Without it, the LLM would have implemented the trial with no awareness of these constraints, and the gaps would have surfaced in production.
+The previously captured behaviour still shapes new implementation work.
 
-### Allium grounds a design conversation
-
-A developer asks for a straightforward feature.
+### Recife grounds a design conversation
 
 ---
 
 > ***> Add an endpoint so admins can view any user's payment history.***
 >
-> ✻ Your Allium doesn't give admins blanket access. `AdminAction` requires the admin's scope to include the target resource. The current scopes are `billing`, `users` and `support`. Should this endpoint require `billing` scope?
+> ✻ Your model does not grant blanket admin access. Access is scope-based. Should this require `:billing-read`?
 >
-> ***> Yes, billing scope. But our support team needs to see payment history too, for resolving disputes. What are our options?***
+> ***> Support also needs access for disputes.***
 >
-> ✻ You could add `billing` to the support role, but that also grants access to refunds and plan changes, which your Allium controls through the same scope.
+> ✻ Then splitting `:billing` into `:billing-read` and `:billing-write` keeps support read-only and finance read/write.
 >
-> ✻ Alternatively, split `billing` into `billing.read` and `billing.write`. Support gets read-only access, finance gets both. Your code in `admin/permissions.py` already distinguishes read and write operations but maps them both to the same scope check, so the implementation is halfway there.
->
-> ***> Go with the read/write split. Update the Allium first, then refactor the scope checks to match.***
+> ***> Do that. Update the model first.***
 
 ---
 
-Without Allium, the LLM would likely have implemented a simple `is_admin` check. Instead, the conversation surfaced a scoping model, explored its implications for a second team, and arrived at a design that aligns the behavioural model with a distinction the code already made but never formalised.
+The model reframes a simple request into a controlled policy decision.
 
 ### Distillation catches drift
 
-A developer asks the LLM to check whether the code still matches the Allium.
+---
+
+> ***> Does our auth implementation still match the Recife model?***
+>
+> ✻ Divergence found. The model locks accounts after 5 failures, but `auth/login.clj` is effectively locking after 3 and does not reset failed attempts on success.
+>
+> ***> Model is authoritative. Fix implementation.***
 
 ---
 
-> ***> Can you check whether our authentication code matches the Allium?***
->
-> ✻ I found a divergence. Your Allium says `LoginFailure` checks `user.failed_login_attempts >= config.max_login_attempts`, configured as 5. But `auth/login.py` line 47 hardcodes the limit at 3 and doesn't reset the counter after a successful login. The Allium says `LoginSuccess` ensures `user.failed_login_attempts = 0`.
->
-> ✻ Either the code drifted or the Allium is aspirational. Which should we trust?
->
-> ***> The Allium is right. Fix the code to match.***
-
----
-
-Code and intent diverge silently over time. Allium gives the LLM something to check against, turning "does this look right?" into a concrete comparison with a definitive answer.
+Recife turns “looks right” into a concrete behavioural check.
 
 ## Language governance
 
-Every change to Allium is debated by a [nine-member review panel](TEAM.md) before adoption. Each panellist represents a distinct design priority: simplicity, machine reasoning, composability, readability, formal rigour, domain modelling, developer experience, creative ambition and backward compatibility. The panel exists to surface tensions that any single perspective would miss.
+Every change to this Recife skill is debated by a [nine-member review panel](TEAM.md) before adoption. Each panellist represents a distinct design priority: simplicity, machine reasoning, composability, readability, formal rigour, domain modelling, developer experience, creative ambition and backward compatibility.
 
-The panel operates in two modes. [Reviews](REVIEW.md) evaluate fixes to rough edges in the existing language, where the default is to fix the problem if a good fix exists. [Proposals](PROPOSE.md) evaluate new features and ambitious changes, where the default is to leave the language alone unless the case for change is strong. Both follow the same debate protocol: present, respond, rebut, synthesise, verdict.
+The panel operates in two modes. [Reviews](REVIEW.md) evaluate fixes to rough edges in existing guidance. [Proposals](PROPOSE.md) evaluate new features and ambitious changes. Both follow the same debate protocol: present, respond, rebut, synthesise, verdict.
 
 ## Feedback
 
-We'd love to hear how you get on with Allium. Success stories, rough edges, missing features, things that surprised you. Drop us a line at [info@juxt.pro](mailto:info@juxt.pro) or [raise an issue](https://github.com/juxt/allium/issues) if you have a specific request.
+Successes, rough edges and missing capabilities are all useful feedback. Please [raise an issue](https://github.com/pfeodrippe/recife/issues).
 
 ## About the name
 
-Allium is the botanical family containing onions and shallots. The name continues a tradition in behaviour specification tooling: Cucumber and Gherkin established botanical naming as a convention in behaviour-driven development, followed by tools like Lettuce and Spinach.
-
-The phonetic echo of "LLM" is intentional, reflecting where we expect these models to be most useful.
-
-The idiom "know your onions" means to understand a subject thoroughly. Engineers have always held two models: what the system should do and what it currently does. Code formalised implementation; intent remained scattered across documents, emails and Slack messages. LLMs generate implementations from descriptions, so Allium consolidates that scattered understanding into an explicit form models can reference reliably.
-
-Like its namesake, working with Allium may produce tears during the peeling, but never at the table.
+Recife is a city in Pernambuco, Brazil. The name reflects a practical, grounded modelling approach: executable behaviour that stays close to real implementation constraints.
 
 ---
 
