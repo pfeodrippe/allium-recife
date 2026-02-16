@@ -672,18 +672,72 @@ A practical surface contract in Recife usually includes:
 
 ## Validation rules
 
-A robust Recife model should satisfy:
+A valid Recife model should satisfy:
 
-1. Every `defproc` returns either `nil` (no transition) or a valid state map.
-2. Global keys are namespaced; local process keys are unnamespaced.
-3. Invariants hold across all reachable states.
-4. Temporal properties are meaningful and checkable.
-5. Event queues are consumed or intentionally retained.
-6. State transitions are monotonic where required by domain policy.
-7. Status/tag sets are constrained via invariants.
-8. No process depends on hidden mutable external state.
-9. Non-deterministic params (when used) are finite sets/colls or functions returning finite collections.
-10. Model time (`:clock/now`) is explicit in temporal logic.
+**Structural validity:**
+1. All referenced vars/functions/namespaces resolve (local or required).
+2. Every process (`r/defproc`) returns either `nil` (no transition) or a valid next-state map.
+3. Global state keys are namespaced keywords; process-local keys are unnamespaced.
+4. Each queue/process trigger source is explicit (event queue, temporal scan, or derived state scan).
+5. Event queues used by multiple processes keep a stable event shape per event `:type`.
+6. Consumed queue events are removed (`disj`) unless retention is intentionally modelled.
+7. Component sets passed to `r/run-model` include every process/invariant/property required by the scenario.
+
+**State machine validity:**
+8. All status values are reachable through some transition path.
+9. Non-terminal statuses have at least one modeled exit.
+10. Processes cannot write status/tag values outside the declared domain set.
+
+**Expression validity:**
+11. All local symbols are bound before use.
+12. Helper functions and derived computations avoid circular dependency.
+13. Comparisons/arithmetic operate on compatible types.
+14. Collection operations are explicit (`map`, `filter`, `reduce`, `contains?`) and scoped to known data.
+15. Optional/nil fields are guarded before arithmetic/navigation.
+16. Non-deterministic choice inputs are finite sets/collections (or finite-producing fns).
+17. Temporal logic uses explicit model time (`:clock/now`) rather than wall-clock calls.
+
+**Variant/sum-shape validity:**
+18. Variant-style entities use an explicit discriminator key (for example `:kind` or `:type`).
+19. Branching on variants is exhaustive where behavior depends on kind (`case`/`cond`/guards).
+20. Variant-specific fields are accessed only under matching type guards.
+21. Created values keep discriminator and shape consistent (no mixed variant payloads).
+
+**Module/global context validity:**
+22. Shared module context is explicit in `global` (no hidden singleton assumptions).
+23. Imported model state and external keys use qualified/namespaced references.
+24. Unqualified symbol references in process code resolve only to local bindings or fn args.
+
+**Config validity:**
+25. Configurable parameters are explicit and have defaults in state (commonly `::config`).
+26. References to config fields correspond to declared config entries.
+27. Durations/timeouts use consistent units and are converted explicitly when needed.
+
+**Surface validity:**
+28. Surface-facing actor mappings correspond to modeled identity predicates.
+29. Exposed fields are reachable from the surface context/facing bindings.
+30. Surface-provided actions map to queue events that are consumed by model processes.
+31. Related surfaces exist and accept compatible context arguments.
+32. Surface `when` guards reference valid, reachable fields.
+33. Iteration in surface projections/actions only targets collection-valued bindings.
+34. Timeout/temporal expectations point to actual temporal process behavior.
+35. Stated surface guarantees are backed by invariants/properties.
+
+The checker should warn (but not error) on:
+
+- open questions with no decision owner/timebox
+- deferred models without location hints
+- unused entities/fields/queues that look accidental
+- processes that can never fire (guards always false)
+- temporal scans without idempotent guards (re-firing risk)
+- surfaces referencing fields that no transition ever updates
+- actor declarations never used by any surface
+- sibling processes that race on the same event type with overlapping guards
+- queue event shapes that drift by producer
+- rules with all effects behind conditionals where one path produces no transition
+- optional temporal fields used without nil checks
+- surface guards weaker than process-level authorization guards
+- unbounded growth collections without cleanup strategy/invariants
 
 Recommended workflow:
 
@@ -698,38 +752,160 @@ Recommended workflow:
 
 ## Anti-patterns
 
-Avoid:
+**Implementation leakage:**
 
-- embedding HTTP/database framework details in model state semantics
-- using model keys that mirror table/ORM internals without domain meaning
-- hiding important transitions inside opaque helper calls with no checks
-- overloading one process with unrelated responsibilities
-- adding non-determinism that is infinite or not controlled
-- using unbounded collections without constraining behavior via invariants/properties
-- mixing command representation formats in one queue
-- writing checks that merely restate code mechanics instead of domain guarantees
+```clojure
+;; Bad
+(-> db
+    (assoc :http/status 200)
+    (assoc :sql/table :users))
 
-Prefer:
+;; Good
+(update db :notifications/outbox conj
+        {:type :user-informed :about :profile-updated})
+```
 
-- small composable processes
-- explicit event queues
-- explicit invariants for safety
-- explicit temporal properties for liveness
-- clear namespace/module boundaries
+**UI/UX in model logic:**
+
+```clojure
+;; Bad
+(update db :ui/widgets conj {:kind :button :label "Confirm"})
+
+;; Good
+(update db :commands/outbox conj {:type :confirm-slot :slot-id slot-id})
+```
+
+**Algorithm-heavy process body:**
+
+```clojure
+;; Bad
+(assoc db ::selected-interviewers
+       (->> candidates
+            (sort-by complex-score)
+            (take 3)
+            (filter available?)))
+
+;; Good
+(assoc db ::suggested-interviewers
+       (interviewer-matching-suggest db candidacy-id))
+```
+
+**External querying inside transitions:**
+
+```clojure
+;; Bad
+(assoc db ::pending (jdbc/query ds ["select * from requests where status='pending'"]))
+
+;; Good
+(assoc db ::pending
+       (filter #(= :pending (:status %)) (vals (::requests db))))
+```
+
+**Implicit shorthand that hides data source:**
+
+```clojure
+;; Bad
+(filter can-admin members)
+
+;; Good
+(filter (fn [member] (true? (:can-admin member))) members)
+```
+
+**Missing temporal guards (re-firing forever):**
+
+```clojure
+;; Bad
+
+(r/defproc invitation-expires
+  (fn [{:keys [::invitations :clock/now] :as db}]
+    (reduce-kv (fn [acc id inv]
+                 (if (<= (:expires-at inv) now)
+                   (assoc-in acc [::invitations id :status] :expired)
+                   acc))
+               db
+               invitations)))
+
+;; Good
+
+(r/defproc invitation-expires
+  (fn [{:keys [::invitations :clock/now] :as db}]
+    (reduce-kv (fn [acc id inv]
+                 (if (and (= :pending (:status inv))
+                          (<= (:expires-at inv) now))
+                   (assoc-in acc [::invitations id :status] :expired)
+                   acc))
+               db
+               invitations)))
+```
+
+**Overly broad status sets with mixed concerns:**
+
+```clojure
+;; Bad
+{:status :draft/:pending/:active/:paused/:resumed/:archived/:deleted}
+
+;; Good
+{:status :pending/:active/:completed/:cancelled
+ :archived? false}
+```
+
+**Transition-only checks used where creation also matters:**
+
+```clojure
+;; Bad: misses entities created already in :scheduled
+(when (= :scheduled (:status-change event)) ...)
+
+;; Good: guard on current state when behavior applies to both paths
+(when (= :scheduled (get-in db [::interviews interview-id :status])) ...)
+```
+
+**Magic numbers in transitions:**
+
+```clojure
+;; Bad
+(assoc-in db [::users uid :retry-deadline] (+ now (* 48 60 60 1000)))
+
+;; Good
+(assoc-in db [::users uid :retry-deadline]
+          (+ now (get-in db [::config :retry-deadline-ms])))
+```
 
 ---
 
 ## Glossary
 
-- **Model state**: the map processed by Recife (`db`), containing global and local process data.
-- **Process (`defproc`)**: a transition producer; returns next state or `nil`.
-- **Step map**: multi-step process definition keyed by step ids, using `:pc` and `r/goto`/`r/done`.
-- **Invariant**: safety property that must always hold (`rh/definvariant`).
-- **Temporal property**: liveness/temporal expectation (`rh/defproperty`).
-- **Action property**: relation between consecutive states (`rh/defaction-property`).
-- **Fairness**: scheduling assumptions for process execution (`rh/deffairness` or `^:fair`).
-- **Global key**: namespaced keyword persisted in global model state.
-- **Local key**: unnamespaced keyword scoped to process instance local state.
-- **Command queue**: collection of requested external actions/events consumed by processes.
-- **Projection**: helper-derived view over entity collections.
-- **Deferred model**: referenced logic modeled in another file/module.
+| Term | Definition |
+|------|------------|
+| **Global context** | The shared model state map (`global`) that all processes transition |
+| **Context (surface)** | Parametric scope binding for a boundary contract; creates one surface instance per matching context |
+| **Entity** | A domain concept with identity and lifecycle (typically a map entry keyed by id) |
+| **Value** | Structured data without independent identity, compared structurally |
+| **Sum type shape** | A tagged map/value constrained to one variant via a discriminator key |
+| **Discriminator** | Field naming the active variant (`:kind`, `:type`, etc.) |
+| **Variant** | One alternative payload shape selected by a discriminator value |
+| **Type guard** | Condition that narrows behavior to one variant/status before field access |
+| **Field** | Data stored on an entity/value |
+| **Relationship** | Navigation between entities through keys/indexes/join maps |
+| **Projection** | A filtered/derived collection view over related entities |
+| **Derived value** | A computed value from existing state (helper fn or inline expression) |
+| **Parameterized derived value** | Derived helper that takes arguments (for example `can-use-feature?`) |
+| **Process (`defproc`)** | A transition producer that returns next state or `nil` |
+| **Trigger source** | Where a transition originates: queue event, temporal scan, or derived-state scan |
+| **Trigger emission** | Writing an event into a queue for other processes to consume |
+| **Precondition** | Guard that must hold for transition to apply |
+| **Postcondition** | State facts guaranteed after a transition |
+| **Black box function** | Deterministic domain helper whose internals are intentionally abstracted |
+| **External model/entity** | State/events governed by another model namespace/spec |
+| **Config** | Explicit configuration values stored in model state (commonly under `::config`) |
+| **Default seed** | Initial entities/config values provided in `global` |
+| **Deferred model** | Logic intentionally split into another file/module |
+| **Open question** | Explicit unresolved design choice tracked in-model/docs |
+| **Entity collection** | All instances of an entity type (commonly `vals` over a namespaced map) |
+| **Exists check** | Presence test for an entity/value (`some?`, `contains?`, lookup by key) |
+| **`within`** | Surface/actor scope concept referencing the current contextual entity |
+| **`this`** | Current entity instance in the active modeling scope/concept |
+| **Enum/tag set** | Closed set of keyword values representing statuses/kinds |
+| **Discard binding** | `_` used for intentionally ignored values |
+| **Actor** | Identity role interacting through a surface boundary |
+| **`facing`** | Surface clause naming the external party on the other side of the boundary |
+| **Surface** | Boundary contract of visible data, allowed actions, and guarantees |
