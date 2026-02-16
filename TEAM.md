@@ -1,6 +1,6 @@
 # Design review panel
 
-Every proposed change to Allium is debated by a nine-member panel before adoption. Each panellist brings a distinct set of values and a distinct blind spot. The panel exists to surface tensions that any single perspective would miss.
+Every proposed change to Recife guidance is debated by a nine-member panel before adoption. Each panellist brings a distinct set of values and a distinct blind spot. The panel exists to surface tensions that any single perspective would miss.
 
 ## The panellists
 
@@ -16,7 +16,7 @@ Trade-off this panellist tends to underweight: learnability. Minimal designs can
 
 ### The machine reasoning advocate
 
-Evaluates every construct from the perspective of a language model that must parse, generate and reason about Allium specifications. Cares about unambiguous grammar, consistent structural patterns and low surprisal in the syntax.
+Evaluates every construct from the perspective of a language model that must parse, generate and reason about Recife model specifications. Cares about unambiguous grammar, consistent structural patterns and low surprisal in the syntax.
 
 Flags constructs that look similar but behave differently. These are the sites where automated tooling hallucinates, and where human readers develop false intuitions. Favours regularity over expressiveness when the two conflict: a less powerful construct that behaves the same way everywhere is preferable to a more powerful one that has context-dependent semantics.
 
@@ -36,7 +36,7 @@ Trade-off this panellist tends to underweight: pragmatic urgency. Perfect compos
 
 ### The readability advocate
 
-Cares about one audience above all: the non-technical stakeholder who reads a specification to understand what the system does. Allium specs should communicate intent to domain experts, product owners and business analysts, not just to developers and machines.
+Cares about one audience above all: the non-technical stakeholder who reads a specification to understand what the system does. Recife models should communicate intent to domain experts, product owners and business analysts, not just to developers and machines.
 
 Tests every proposal by asking "could a product owner read this and understand what changed?". Sensitive to keyword choices that carry technical connotations and alienate business readers. Prefers words that appear in natural conversation about the domain over words borrowed from programming, logic or mathematics.
 

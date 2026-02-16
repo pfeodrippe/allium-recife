@@ -1,2559 +1,1812 @@
 # Complete patterns
 
-This library contains reusable patterns for common SaaS scenarios. Each pattern demonstrates specific Allium language features and can be adapted to your domain.
+This library contains reusable Recife model patterns for common SaaS scenarios. Each pattern mirrors the original behavioral intent while expressing it as executable Clojure model code.
 
-Patterns elide common cross-cutting entities (`Email`, `Notification`, `AuditLog`, etc.) for brevity. In a real specification, declare these as external entities or define them in a shared module.
+Patterns elide common cross-cutting entities (`Email`, `Notification`, `AuditLog`, etc.) for brevity. In a real model, define these in shared namespaces.
 
 | Pattern | Key Features Demonstrated |
 |---------|---------------------------|
 | Password Auth with Reset | Temporal triggers, token lifecycle, defaults, surfaces |
-| Role-Based Access Control | Derived permissions, relationships, `requires` checks, surfaces |
-| Invitation to Resource | Join entities, permission levels, tokenised actions, surfaces |
+| Role-Based Access Control | Derived permissions, relationships, guard checks, surfaces |
+| Invitation to Resource | Join entities, permission levels, invitation lifecycle, surfaces |
 | Soft Delete & Restore | State machines, projections filtering deleted items |
-| Notification Preferences | Sum types for notification variants, user preferences, digest batching, surfaces |
-| Usage Limits & Quotas | Limit checks in `requires`, metered resources, plan tiers, surfaces |
-| Comments with Mentions | Nested entities, parsing triggers, cross-entity notifications, surfaces |
-| Integrating Library Specs | External spec references, configuration, responding to external triggers |
-
----
+| Notification Preferences | Notification variants, user preferences, digest batching, surfaces |
+| Usage Limits & Quotas | Limit checks, metered resources, plan tiers, surfaces |
+| Comments with Mentions | Nested entities, mention parsing, cross-entity notifications, surfaces |
+| Integrating Library Specs | External model references, configuration, external trigger handling |
 
 ## Pattern 1: Password Authentication with Reset
 
-**Demonstrates:** Temporal triggers, token lifecycle, defaults, surfaces, multiple related rules
+File: `password-auth.model.clj`
 
-This pattern handles user registration, login and password reset: the foundation of most SaaS applications.
+```clojure
+(ns patterns.password-auth.model
+  (:require [recife.core :as r]))
 
+(def global
+  {::config {:min-password-length 12
+             :max-login-attempts 5
+             :lockout-duration-ms (* 15 60 1000)
+             :reset-token-expiry-ms (* 60 60 1000)
+             :session-duration-ms (* 24 60 60 1000)}
+   ::users {}
+   ::sessions {}
+   ::reset-tokens {}
+   :auth/register #{}
+   :auth/login #{}
+   :auth/logout #{}
+   :auth/request-reset #{}
+   :auth/complete-reset #{}
+   :auth/notifications []
+   :mail/outbox []
+   :clock/now 0})
+
+(defn user-by-email [db email]
+  (first (filter (fn [[_ u]] (= email (:email u))) (::users db))))
+
+(defn password-valid? [user password]
+  (= (str "hash:" password) (:password-hash user)))
+
+(defn user-locked? [db user]
+  (and (= :locked (:status user))
+       (some? (:locked-until user))
+       (> (:locked-until user) (:clock/now db))))
+
+(defn next-id [prefix m]
+  (keyword (str prefix "-" (inc (count m)))))
+
+(defn token-valid? [db token]
+  (and (= :pending (:status token))
+       (> (:expires-at token) (:clock/now db))))
+
+(r/defproc register
+  (fn [{:keys [:auth/register] :as db}]
+    (when-let [{:keys [email password] :as cmd} (first register)]
+      (when (and (nil? (user-by-email db email))
+                 (>= (count password) (get-in db [::config :min-password-length])))
+        (let [user-id (next-id "user" (::users db))
+              now (:clock/now db)]
+          (-> db
+              (update :auth/register disj cmd)
+              (assoc-in [::users user-id]
+                        {:email email
+                         :password-hash (str "hash:" password)
+                         :status :active
+                         :failed-login-attempts 0
+                         :locked-until nil
+                         :created-at now})
+              (update :mail/outbox conj {:to email :template :welcome})))))))
+
+(r/defproc login-success
+  (fn [{:keys [:auth/login] :as db}]
+    (when-let [{:keys [email password] :as cmd} (first login)]
+      (when-let [[user-id user] (user-by-email db email)]
+        (when (and (not (user-locked? db user))
+                   (password-valid? user password))
+          (let [now (:clock/now db)
+                session-id (next-id "session" (::sessions db))]
+            (-> db
+                (update :auth/login disj cmd)
+                (assoc-in [::users user-id :failed-login-attempts] 0)
+                (assoc-in [::users user-id :status] :active)
+                (assoc-in [::users user-id :locked-until] nil)
+                (assoc-in [::sessions session-id]
+                          {:user-id user-id
+                           :created-at now
+                           :expires-at (+ now (get-in db [::config :session-duration-ms]))
+                           :status :active}))))))))
+
+(r/defproc login-failure
+  (fn [{:keys [:auth/login] :as db}]
+    (when-let [{:keys [email password] :as cmd} (first login)]
+      (when-let [[user-id user] (user-by-email db email)]
+        (when (and (not (user-locked? db user))
+                   (not (password-valid? user password)))
+          (let [attempts (inc (:failed-login-attempts user))
+                max-attempts (get-in db [::config :max-login-attempts])
+                now (:clock/now db)
+                db' (-> db
+                        (update :auth/login disj cmd)
+                        (assoc-in [::users user-id :failed-login-attempts] attempts))]
+            (if (>= attempts max-attempts)
+              (-> db'
+                  (assoc-in [::users user-id :status] :locked)
+                  (assoc-in [::users user-id :locked-until]
+                            (+ now (get-in db [::config :lockout-duration-ms])))
+                  (update :mail/outbox conj {:to (:email user)
+                                             :template :account-locked}))
+              db')))))))
+
+(r/defproc login-attempt-while-locked
+  (fn [{:keys [:auth/login] :as db}]
+    (when-let [{:keys [email] :as cmd} (first login)]
+      (when-let [[_ user] (user-by-email db email)]
+        (when (user-locked? db user)
+          (-> db
+              (update :auth/login disj cmd)
+              (update :auth/notifications conj
+                      {:type :user-informed
+                       :about :account-locked
+                       :email email
+                       :unlocks-at (:locked-until user)})))))))
+
+(r/defproc lockout-expires
+  (fn [{:keys [::users :clock/now] :as db}]
+    (reduce-kv
+     (fn [acc user-id user]
+       (if (and (= :locked (:status user))
+                (some? (:locked-until user))
+                (<= (:locked-until user) now))
+         (-> acc
+             (assoc-in [::users user-id :status] :active)
+             (assoc-in [::users user-id :failed-login-attempts] 0)
+             (assoc-in [::users user-id :locked-until] nil))
+         acc))
+     db
+     users)))
+
+(r/defproc logout
+  (fn [{:keys [:auth/logout] :as db}]
+    (when-let [{:keys [session-id] :as cmd} (first logout)]
+      (when (= :active (get-in db [::sessions session-id :status]))
+        (-> db
+            (update :auth/logout disj cmd)
+            (assoc-in [::sessions session-id :status] :revoked))))))
+
+(r/defproc session-expires
+  (fn [{:keys [::sessions :clock/now] :as db}]
+    (reduce-kv
+     (fn [acc session-id session]
+       (if (and (= :active (:status session))
+                (<= (:expires-at session) now))
+         (assoc-in acc [::sessions session-id :status] :expired)
+         acc))
+     db
+     sessions)))
+
+(r/defproc request-password-reset
+  (fn [{:keys [:auth/request-reset] :as db}]
+    (when-let [{:keys [email] :as cmd} (first request-reset)]
+      (when-let [[user-id user] (user-by-email db email)]
+        (when (contains? #{:active :locked} (:status user))
+          (let [token-id (next-id "token" (::reset-tokens db))
+                now (:clock/now db)
+                db' (-> db
+                        (update :auth/request-reset disj cmd)
+                        (update ::reset-tokens
+                                (fn [tokens]
+                                  (into {}
+                                        (map (fn [[tid token]]
+                                               [tid (if (and (= user-id (:user-id token))
+                                                             (= :pending (:status token)))
+                                                      (assoc token :status :expired)
+                                                      token)]))
+                                        tokens)))
+                        (assoc-in [::reset-tokens token-id]
+                                  {:user-id user-id
+                                   :created-at now
+                                   :expires-at (+ now (get-in db [::config :reset-token-expiry-ms]))
+                                   :status :pending}))]
+            (update db' :mail/outbox conj
+                    {:to email :template :password-reset :data {:token-id token-id}})))))))
+
+(r/defproc complete-password-reset
+  (fn [{:keys [:auth/complete-reset] :as db}]
+    (when-let [{:keys [token-id new-password] :as cmd} (first complete-reset)]
+      (when-let [token (get-in db [::reset-tokens token-id])]
+        (when (and (token-valid? db token)
+                   (>= (count new-password) (get-in db [::config :min-password-length])))
+          (let [user-id (:user-id token)
+                user (get-in db [::users user-id])
+                db' (-> db
+                        (update :auth/complete-reset disj cmd)
+                        (assoc-in [::reset-tokens token-id :status] :used)
+                        (assoc-in [::users user-id :password-hash] (str "hash:" new-password))
+                        (assoc-in [::users user-id :status] :active)
+                        (assoc-in [::users user-id :failed-login-attempts] 0)
+                        (assoc-in [::users user-id :locked-until] nil)
+                        (update ::sessions
+                                (fn [sessions]
+                                  (into {}
+                                        (map (fn [[sid session]]
+                                               [sid (if (and (= user-id (:user-id session))
+                                                             (= :active (:status session)))
+                                                      (assoc session :status :revoked)
+                                                      session)]))
+                                        sessions))))]
+            (update db' :mail/outbox conj
+                    {:to (:email user) :template :password-changed})))))))
+
+(r/defproc reset-token-expires
+  (fn [{:keys [::reset-tokens :clock/now] :as db}]
+    (reduce-kv
+     (fn [acc token-id token]
+       (if (and (= :pending (:status token))
+                (<= (:expires-at token) now))
+         (assoc-in acc [::reset-tokens token-id :status] :expired)
+         acc))
+     db
+     reset-tokens)))
 ```
--- password-auth.allium
-
-config {
-    min_password_length: Integer = 12
-    max_login_attempts: Integer = 5
-    lockout_duration: Duration = 15.minutes
-    reset_token_expiry: Duration = 1.hour
-    session_duration: Duration = 24.hours
-}
-
-------------------------------------------------------------
--- Entities
-------------------------------------------------------------
-
-entity User {
-    email: String
-    password_hash: String          -- stored, never exposed
-    status: active | locked | deactivated
-    failed_login_attempts: Integer
-    locked_until: Timestamp?
-
-    -- Relationships
-    sessions: Session with user = this
-    reset_tokens: PasswordResetToken with user = this
-
-    -- Projections
-    active_sessions: sessions where status = active
-    pending_reset_tokens: reset_tokens where status = pending
-
-    -- Derived
-    is_locked: status = locked and locked_until > now
-}
-
-entity Session {
-    user: User
-    created_at: Timestamp
-    expires_at: Timestamp
-    status: active | expired | revoked
-
-    -- Derived
-    is_valid: status = active and expires_at > now
-}
-
-entity PasswordResetToken {
-    user: User
-    created_at: Timestamp
-    expires_at: Timestamp
-    status: pending | used | expired
-
-    -- Derived
-    is_valid: status = pending and expires_at > now
-}
-
-------------------------------------------------------------
--- Registration
-------------------------------------------------------------
-
-rule Register {
-    when: UserRegisters(email, password)
-
-    requires: not exists User{email: email}
-    requires: length(password) >= config.min_password_length
-
-    ensures: User.created(
-        email: email,
-        password_hash: hash(password),    -- black box
-        status: active,
-        failed_login_attempts: 0
-    )
-    ensures: Email.created(
-        to: email,
-        template: welcome
-    )
-}
-
-------------------------------------------------------------
--- Login
-------------------------------------------------------------
-
-rule LoginSuccess {
-    when: UserLogsIn(email, password)
-
-    let user = User{email}
-
-    requires: exists user
-    requires: not user.is_locked
-    requires: verify(password, user.password_hash)    -- black box
-
-    ensures: user.failed_login_attempts = 0
-    ensures: Session.created(
-        user: user,
-        created_at: now,
-        expires_at: now + config.session_duration,
-        status: active
-    )
-}
-
-rule LoginFailure {
-    when: UserLogsIn(email, password)
-
-    let user = User{email}
-
-    requires: exists user
-    requires: not user.is_locked
-    requires: not verify(password, user.password_hash)
-
-    ensures: user.failed_login_attempts = user.failed_login_attempts + 1
-    ensures:
-        if user.failed_login_attempts >= config.max_login_attempts:
-            user.status = locked
-            user.locked_until = now + config.lockout_duration
-            Email.created(to: user.email, template: account_locked)
-}
-
-rule LoginAttemptWhileLocked {
-    when: UserLogsIn(email, password)
-
-    let user = User{email}
-
-    requires: exists user
-    requires: user.is_locked
-
-    ensures: UserInformed(
-        user: user,
-        about: account_locked,
-        data: { unlocks_at: user.locked_until }
-    )
-}
-
-rule LockoutExpires {
-    when: user: User.locked_until <= now
-
-    requires: user.status = locked
-
-    ensures: user.status = active
-    ensures: user.failed_login_attempts = 0
-    ensures: user.locked_until = null
-}
-
-------------------------------------------------------------
--- Logout
-------------------------------------------------------------
-
-rule Logout {
-    when: UserLogsOut(session)
-
-    requires: session.status = active
-
-    ensures: session.status = revoked
-}
-
-rule SessionExpires {
-    when: session: Session.expires_at <= now
-
-    requires: session.status = active
-
-    ensures: session.status = expired
-}
-
-------------------------------------------------------------
--- Password Reset
-------------------------------------------------------------
-
-rule RequestPasswordReset {
-    when: UserRequestsPasswordReset(email)
-
-    let user = User{email}
-
-    requires: exists user
-    requires: user.status in {active, locked}
-
-    -- Invalidate any existing tokens
-    ensures:
-        for t in user.pending_reset_tokens:
-            t.status = expired
-
-    ensures:
-        let token = PasswordResetToken.created(
-            user: user,
-            created_at: now,
-            expires_at: now + config.reset_token_expiry,
-            status: pending
-        )
-        Email.created(
-            to: email,
-            template: password_reset,
-            data: { token: token }
-        )
-}
-
-rule CompletePasswordReset {
-    when: UserResetsPassword(token, new_password)
-
-    requires: token.is_valid
-    requires: length(new_password) >= config.min_password_length
-
-    let user = token.user
-
-    ensures: token.status = used
-    ensures: user.password_hash = hash(new_password)
-    ensures: user.status = active
-    ensures: user.failed_login_attempts = 0
-    ensures: user.locked_until = null
-
-    -- Invalidate all existing sessions
-    ensures:
-        for s in user.active_sessions:
-            s.status = revoked
-
-    ensures: Email.created(
-        to: user.email,
-        template: password_changed
-    )
-}
-
-rule ResetTokenExpires {
-    when: token: PasswordResetToken.expires_at <= now
-
-    requires: token.status = pending
-
-    ensures: token.status = expired
-}
-
-------------------------------------------------------------
--- Actors
-------------------------------------------------------------
-
-actor AuthenticatedUser {
-    identified_by: User where active_sessions.count > 0
-}
-
-------------------------------------------------------------
--- Surfaces
-------------------------------------------------------------
-
-surface Authentication {
-    facing visitor: User
-
-    provides:
-        UserLogsIn(email, password)
-        UserRegisters(email, password)
-        UserRequestsPasswordReset(email)
-
-    guarantee: NoSessionRequired
-        -- Accessible without an existing session.
-
-    guidance:
-        -- Show lockout status and unlock time when user.is_locked.
-        -- Validate password length client-side before submission.
-}
-
-surface PasswordReset {
-    facing visitor: User
-
-    context token: PasswordResetToken
-
-    exposes:
-        token.is_valid
-        token.expires_at
-
-    provides:
-        UserResetsPassword(token, new_password)
-            when token.is_valid
-
-    guarantee: NoSessionRequired
-        -- Accessible without an existing session.
-}
-
-surface AccountManagement {
-    facing user: AuthenticatedUser
-
-    exposes:
-        user.email
-        user.active_sessions
-        user.active_sessions.count
-
-    provides:
-        for session in user.active_sessions:
-            UserLogsOut(session)
-        UserRequestsPasswordReset(user.email)
-}
-```
-
-**Key language features shown:**
-- `config` block for configurable parameters (`config.min_password_length`, etc.)
-- Derived values (`is_locked`, `is_valid`)
-- Multiple rules for same trigger with different `requires` (login success vs failure)
-- Temporal triggers with guards (`when: token: PasswordResetToken.expires_at <= now` with `requires: status = pending`)
-- Projections for filtered collections (`pending_reset_tokens`)
-- Bulk updates with `for` iteration
-- Explicit `let` binding for created entities
-- Black box functions (`hash()`, `verify()`)
-- Surfaces with `facing` declaration and `for` iteration in `provides`
-
----
 
 ## Pattern 2: Role-Based Access Control (RBAC)
 
-**Demonstrates:** Derived permissions, relationships, using permissions in `requires` clauses, surfaces
+File: `rbac.model.clj`
 
-This pattern implements hierarchical roles where higher roles inherit permissions from lower ones.
+```clojure
+(ns patterns.rbac.model
+  (:require [clojure.set :as set]
+            [recife.core :as r]))
 
+(def global
+  {::roles {:viewer {:name "viewer"
+                     :permissions #{"documents.read"}
+                     :inherits-from nil}
+            :editor {:name "editor"
+                     :permissions #{"documents.write"}
+                     :inherits-from :viewer}
+            :admin {:name "admin"
+                    :permissions #{"workspace.admin" "members.manage"}
+                    :inherits-from :editor}}
+   ::workspaces {}
+   ::users {}
+   ::workspace-memberships {}
+   ::documents {}
+   ::document-views {}
+   :rbac/events #{}
+   :mail/outbox []
+   :clock/now 0})
+
+(defn take-event [events event-type]
+  (first (filter #(= event-type (:type %)) events)))
+
+(defn effective-permissions [db role-id]
+  (let [role (get-in db [::roles role-id])]
+    (if-let [parent (:inherits-from role)]
+      (set/union (:permissions role)
+                 (effective-permissions db parent))
+      (:permissions role))))
+
+(defn membership [db workspace-id user-id]
+  (get-in db [::workspace-memberships [workspace-id user-id]]))
+
+(defn can-read? [db workspace-id user-id]
+  (contains? (effective-permissions db (:role (membership db workspace-id user-id)))
+             "documents.read"))
+
+(defn can-write? [db workspace-id user-id]
+  (contains? (effective-permissions db (:role (membership db workspace-id user-id)))
+             "documents.write"))
+
+(defn can-admin? [db workspace-id user-id]
+  (contains? (effective-permissions db (:role (membership db workspace-id user-id)))
+             "workspace.admin"))
+
+(r/defproc create-workspace
+  (fn [{:keys [:rbac/events] :as db}]
+    (when-let [{:keys [user-id name] :as cmd} (take-event events :create-workspace)]
+      (let [workspace-id (keyword (str "workspace-" (inc (count (::workspaces db)))))
+            now (:clock/now db)]
+        (-> db
+            (update :rbac/events disj cmd)
+            (assoc-in [::workspaces workspace-id]
+                      {:name name :owner-id user-id})
+            (assoc-in [::workspace-memberships [workspace-id user-id]]
+                      {:workspace-id workspace-id
+                       :user-id user-id
+                       :role :admin
+                       :joined-at now}))))))
+
+(r/defproc add-member
+  (fn [{:keys [:rbac/events] :as db}]
+    (when-let [{:keys [actor-id workspace-id new-user-id role] :as cmd}
+               (take-event events :add-member)]
+      (when (and (can-admin? db workspace-id actor-id)
+                 (nil? (membership db workspace-id new-user-id)))
+        (-> db
+            (update :rbac/events disj cmd)
+            (assoc-in [::workspace-memberships [workspace-id new-user-id]]
+                      {:workspace-id workspace-id
+                       :user-id new-user-id
+                       :role role
+                       :joined-at (:clock/now db)})
+            (update :mail/outbox conj
+                    {:to (get-in db [::users new-user-id :email])
+                     :template :added-to-workspace
+                     :data {:workspace-id workspace-id :role role}}))))))
+
+(r/defproc change-member-role
+  (fn [{:keys [:rbac/events] :as db}]
+    (when-let [{:keys [actor-id workspace-id target-user-id new-role] :as cmd}
+               (take-event events :change-member-role)]
+      (when (and (can-admin? db workspace-id actor-id)
+                 (some? (membership db workspace-id target-user-id))
+                 (not= target-user-id (get-in db [::workspaces workspace-id :owner-id])))
+        (-> db
+            (update :rbac/events disj cmd)
+            (assoc-in [::workspace-memberships [workspace-id target-user-id] :role] new-role))))))
+
+(r/defproc remove-member
+  (fn [{:keys [:rbac/events] :as db}]
+    (when-let [{:keys [actor-id workspace-id target-user-id] :as cmd}
+               (take-event events :remove-member)]
+      (when (and (can-admin? db workspace-id actor-id)
+                 (some? (membership db workspace-id target-user-id))
+                 (not= target-user-id (get-in db [::workspaces workspace-id :owner-id])))
+        (-> db
+            (update :rbac/events disj cmd)
+            (update ::workspace-memberships dissoc [workspace-id target-user-id]))))))
+
+(r/defproc leave-workspace
+  (fn [{:keys [:rbac/events] :as db}]
+    (when-let [{:keys [user-id workspace-id] :as cmd} (take-event events :leave-workspace)]
+      (when (and (some? (membership db workspace-id user-id))
+                 (not= user-id (get-in db [::workspaces workspace-id :owner-id])))
+        (-> db
+            (update :rbac/events disj cmd)
+            (update ::workspace-memberships dissoc [workspace-id user-id]))))))
+
+(r/defproc grant-permission
+  (fn [{:keys [:rbac/events] :as db}]
+    (when-let [{:keys [actor-id workspace-id role-id permission] :as cmd}
+               (take-event events :grant-permission)]
+      (when (and (can-admin? db workspace-id actor-id)
+                 (not (contains? (effective-permissions db role-id) permission)))
+        (-> db
+            (update :rbac/events disj cmd)
+            (update-in [::roles role-id :permissions] conj permission))))))
+
+(r/defproc revoke-permission
+  (fn [{:keys [:rbac/events] :as db}]
+    (when-let [{:keys [actor-id workspace-id role-id permission] :as cmd}
+               (take-event events :revoke-permission)]
+      (when (and (can-admin? db workspace-id actor-id)
+                 (contains? (get-in db [::roles role-id :permissions]) permission))
+        (-> db
+            (update :rbac/events disj cmd)
+            (update-in [::roles role-id :permissions] disj permission))))))
+
+(r/defproc create-document
+  (fn [{:keys [:rbac/events] :as db}]
+    (when-let [{:keys [user-id workspace-id title content] :as cmd}
+               (take-event events :create-document)]
+      (when (can-write? db workspace-id user-id)
+        (let [document-id (keyword (str "document-" (inc (count (::documents db)))))]
+          (-> db
+              (update :rbac/events disj cmd)
+              (assoc-in [::documents document-id]
+                        {:workspace-id workspace-id
+                         :created-by user-id
+                         :title title
+                         :content content})))))))
+
+(r/defproc view-document
+  (fn [{:keys [:rbac/events] :as db}]
+    (when-let [{:keys [user-id document-id] :as cmd}
+               (take-event events :view-document)]
+      (let [workspace-id (get-in db [::documents document-id :workspace-id])]
+        (when (can-read? db workspace-id user-id)
+          (let [view-id (keyword (str "view-" (inc (count (::document-views db)))))]
+            (-> db
+                (update :rbac/events disj cmd)
+                (assoc-in [::document-views view-id]
+                          {:user-id user-id
+                           :document-id document-id
+                           :at (:clock/now db)}))))))))
 ```
--- rbac.allium
-
-------------------------------------------------------------
--- Entities
-------------------------------------------------------------
-
-entity Role {
-    name: String                    -- e.g., "viewer", "editor", "admin"
-    permissions: Set<String>        -- e.g., { "documents.read", "documents.write" }
-    inherits_from: Role?            -- optional parent role
-
-    -- Derived: all permissions including inherited
-    effective_permissions:
-        permissions + (inherits_from?.effective_permissions ?? {})
-}
-
-entity User {
-    email: String
-    name: String
-}
-
-entity Workspace {
-    name: String
-    owner: User
-
-    -- Relationships
-    memberships: WorkspaceMembership with workspace = this
-    documents: Document with workspace = this
-
-    -- Projections
-    members: memberships -> user
-    admins: memberships where role.name = "admin" -> user
-}
-
-entity Document {
-    workspace: Workspace
-    created_by: User
-    title: String
-    content: String
-}
-
-entity DocumentView {
-    user: User
-    document: Document
-    at: Timestamp
-}
-
--- Join entity connecting User, Workspace, and Role
-entity WorkspaceMembership {
-    user: User
-    workspace: Workspace
-    role: Role
-    joined_at: Timestamp
-
-    -- Derived: check specific permissions
-    can_read: "documents.read" in role.effective_permissions
-    can_write: "documents.write" in role.effective_permissions
-    can_admin: "workspace.admin" in role.effective_permissions
-}
-
-------------------------------------------------------------
--- Defaults
-------------------------------------------------------------
-
-default Role viewer = {
-    name: "viewer",
-    permissions: { "documents.read" }
-}
-
-default Role editor = {
-    name: "editor",
-    permissions: { "documents.write" },
-    inherits_from: viewer
-}
-
-default Role admin = {
-    name: "admin",
-    permissions: { "workspace.admin", "members.manage" },
-    inherits_from: editor
-}
-
-------------------------------------------------------------
--- Rules
-------------------------------------------------------------
-
-rule CreateWorkspace {
-    when: UserCreatesWorkspace(user, name)
-
-    ensures:
-        let workspace = Workspace.created(
-            name: name,
-            owner: user
-        )
-        -- Owner automatically becomes admin
-        WorkspaceMembership.created(
-            user: user,
-            workspace: workspace,
-            role: admin,
-            joined_at: now
-        )
-}
-
-rule AddMember {
-    when: AddMemberToWorkspace(actor, workspace, new_user, role)
-
-    let actor_membership = WorkspaceMembership{user: actor, workspace: workspace}
-
-    requires: actor_membership.can_admin
-    requires: not exists WorkspaceMembership{user: new_user, workspace: workspace}
-
-    ensures: WorkspaceMembership.created(
-        user: new_user,
-        workspace: workspace,
-        role: role,
-        joined_at: now
-    )
-    ensures: Email.created(
-        to: new_user.email,
-        template: added_to_workspace,
-        data: { workspace: workspace, role: role }
-    )
-}
-
-rule ChangeMemberRole {
-    when: ChangeMemberRole(actor, workspace, target_user, new_role)
-
-    let actor_membership = WorkspaceMembership{user: actor, workspace: workspace}
-    let target_membership = WorkspaceMembership{user: target_user, workspace: workspace}
-
-    requires: actor_membership.can_admin
-    requires: exists target_membership
-    requires: target_user != workspace.owner    -- can't change owner's role
-
-    ensures: target_membership.role = new_role
-}
-
-rule RemoveMember {
-    when: RemoveMemberFromWorkspace(actor, workspace, target_user)
-
-    let actor_membership = WorkspaceMembership{user: actor, workspace: workspace}
-    let target_membership = WorkspaceMembership{user: target_user, workspace: workspace}
-
-    requires: actor_membership.can_admin
-    requires: exists target_membership
-    requires: target_user != workspace.owner    -- can't remove owner
-
-    ensures: not exists target_membership
-}
-
-rule LeaveWorkspace {
-    when: UserLeavesWorkspace(user, workspace)
-
-    let membership = WorkspaceMembership{user, workspace}
-
-    requires: exists membership
-    requires: user != workspace.owner    -- owner can't leave
-
-    ensures: not exists membership
-}
-
-------------------------------------------------------------
--- Managing permissions on roles
-------------------------------------------------------------
-
-rule GrantPermission {
-    when: GrantPermission(actor, workspace, role, permission)
-
-    let actor_membership = WorkspaceMembership{user: actor, workspace: workspace}
-
-    requires: actor_membership.can_admin
-    requires: permission not in role.effective_permissions
-
-    ensures: role.permissions.add(permission)
-}
-
-rule RevokePermission {
-    when: RevokePermission(actor, workspace, role, permission)
-
-    let actor_membership = WorkspaceMembership{user: actor, workspace: workspace}
-
-    requires: actor_membership.can_admin
-    requires: permission in role.permissions    -- only direct, not inherited
-
-    ensures: role.permissions.remove(permission)
-}
-
-------------------------------------------------------------
--- Using permissions in other rules
-------------------------------------------------------------
-
-rule CreateDocument {
-    when: CreateDocument(user, workspace, title, content)
-
-    let membership = WorkspaceMembership{user, workspace}
-
-    requires: membership.can_write
-
-    ensures: Document.created(
-        workspace: workspace,
-        created_by: user,
-        title: title,
-        content: content
-    )
-}
-
-rule ViewDocument {
-    when: ViewDocument(user, document)
-
-    let membership = WorkspaceMembership{user: user, workspace: document.workspace}
-
-    requires: membership.can_read
-
-    ensures: DocumentView.created(user: user, document: document, at: now)
-}
-
-------------------------------------------------------------
--- Actors
-------------------------------------------------------------
-
-actor WorkspaceAdmin {
-    within: Workspace
-    identified_by: User where WorkspaceMembership{user: this, workspace: within}.can_admin = true
-}
-
-actor WorkspaceEditor {
-    within: Workspace
-    identified_by: User where WorkspaceMembership{user: this, workspace: within}.can_write = true
-}
-
-actor WorkspaceViewer {
-    within: Workspace
-    identified_by: User where WorkspaceMembership{user: this, workspace: within}.can_read = true
-}
-
-------------------------------------------------------------
--- Surfaces
-------------------------------------------------------------
-
-surface WorkspaceMemberManagement {
-    facing admin: WorkspaceAdmin
-
-    context workspace: Workspace
-
-    exposes:
-        workspace.name
-        workspace.memberships
-        workspace.admins
-
-    provides:
-        AddMemberToWorkspace(admin, workspace, new_user, role)
-        ChangeMemberRole(admin, workspace, target_user, new_role)
-            when target_user != workspace.owner
-        RemoveMemberFromWorkspace(admin, workspace, target_user)
-            when target_user != workspace.owner
-
-    guarantee: OwnerProtection
-        -- The workspace owner's role cannot be changed or removed.
-}
-
-surface WorkspaceDocuments {
-    facing member: User
-
-    context workspace: Workspace
-
-    let membership = WorkspaceMembership{user: member, workspace: workspace}
-
-    exposes:
-        workspace.name
-        workspace.documents
-
-    provides:
-        CreateDocument(member, workspace, title, content)
-            when membership.can_write
-        for document in workspace.documents:
-            ViewDocument(member, document)
-                when membership.can_read
-
-    related:
-        WorkspaceMemberManagement(workspace)
-            when membership.can_admin
-}
-```
-
-**Key language features shown:**
-- Recursive derived values (`effective_permissions` includes inherited)
-- Null-safe navigation (`inherits_from?.effective_permissions ?? {}`)
-- Join entity lookup (`WorkspaceMembership{user: actor, workspace: workspace}`)
-- Permission checks in `requires` clauses
-- String set membership with `in` operator
-- `.add()` and `.remove()` for set mutation in ensures clauses
-- `not exists` as an outcome (removes the entity)
-- Surfaces with role-based actors and permission-gated actions
-- `related` clause for cross-surface navigation
-
----
 
 ## Pattern 3: Invitation to Resource
 
-**Demonstrates:** Tokenised actions, permission levels, invitation lifecycle, guest vs member flows, surfaces
+File: `resource-invitation.model.clj`
 
-This pattern handles inviting users to collaborate on resources, whether they're existing users or not.
+```clojure
+(ns patterns.resource-invitation.model
+  (:require [recife.core :as r]))
 
+(def global
+  {::config {:invitation-expiry-ms (* 7 24 60 60 1000)}
+   ::users {}
+   ::resources {}
+   ::resource-shares {}
+   ::resource-invitations {}
+   :resource/events #{}
+   :mail/outbox []
+   :notifications/outbox []
+   :clock/now 0})
+
+(defn take-event [events event-type]
+  (first (filter #(= event-type (:type %)) events)))
+
+(defn can-admin-resource? [db resource-id user-id]
+  (or (= user-id (get-in db [::resources resource-id :owner-id]))
+      (= :admin (get-in db [::resource-shares [resource-id user-id] :permission]))))
+
+(defn can-invite? [db resource-id user-id]
+  (or (= user-id (get-in db [::resources resource-id :owner-id]))
+      (contains? #{:edit :admin}
+                 (get-in db [::resource-shares [resource-id user-id] :permission]))))
+
+(defn invitation-valid? [db invitation]
+  (and (= :pending (:status invitation))
+       (> (:expires-at invitation) (:clock/now db))))
+
+(r/defproc invite-to-resource
+  (fn [{:keys [:resource/events] :as db}]
+    (when-let [{:keys [inviter-id resource-id email permission] :as cmd}
+               (take-event events :invite-to-resource)]
+      (let [owner? (= inviter-id (get-in db [::resources resource-id :owner-id]))
+            existing-active? (some (fn [[[rid uid] share]]
+                                     (and (= resource-id rid)
+                                          (= :active (:status share))
+                                          (= email (get-in db [::users uid :email]))))
+                                   (::resource-shares db))]
+        (when (and (can-invite? db resource-id inviter-id)
+                   (or (contains? #{:view :edit} permission)
+                       (and (= :admin permission) owner?))
+                   (not existing-active?))
+          (let [inv-id (keyword (str "invitation-" (inc (count (::resource-invitations db)))))
+                now (:clock/now db)]
+            (-> db
+                (update :resource/events disj cmd)
+                (assoc-in [::resource-invitations inv-id]
+                          {:resource-id resource-id
+                           :email email
+                           :permission permission
+                           :invited-by inviter-id
+                           :created-at now
+                           :expires-at (+ now (get-in db [::config :invitation-expiry-ms]))
+                           :status :pending})
+                (update :mail/outbox conj
+                        {:to email
+                         :template :resource-invitation
+                         :data {:resource-id resource-id
+                                :invited-by inviter-id
+                                :permission permission}}))))))))
+
+(r/defproc accept-invitation-existing-user
+  (fn [{:keys [:resource/events] :as db}]
+    (when-let [{:keys [invitation-id user-id] :as cmd}
+               (take-event events :accept-invitation-existing-user)]
+      (when-let [invitation (get-in db [::resource-invitations invitation-id])]
+        (when (and (invitation-valid? db invitation)
+                   (= (:email invitation) (get-in db [::users user-id :email])))
+          (-> db
+              (update :resource/events disj cmd)
+              (assoc-in [::resource-invitations invitation-id :status] :accepted)
+              (assoc-in [::resource-shares [(:resource-id invitation) user-id]]
+                        {:resource-id (:resource-id invitation)
+                         :user-id user-id
+                         :permission (:permission invitation)
+                         :status :active
+                         :created-at (:clock/now db)})
+              (update :notifications/outbox conj
+                      {:to (:invited-by invitation)
+                       :template :invitation-accepted
+                       :data {:resource-id (:resource-id invitation)
+                              :user-id user-id}})))))))
+
+(r/defproc accept-invitation-new-user
+  (fn [{:keys [:resource/events] :as db}]
+    (when-let [{:keys [invitation-id email name password] :as cmd}
+               (take-event events :accept-invitation-new-user)]
+      (when-let [invitation (get-in db [::resource-invitations invitation-id])]
+        (let [existing-user? (some (fn [[_ user]] (= email (:email user))) (::users db))]
+          (when (and (invitation-valid? db invitation)
+                     (= email (:email invitation))
+                     (not existing-user?))
+            (let [user-id (keyword (str "user-" (inc (count (::users db)))))
+                  now (:clock/now db)]
+              (-> db
+                  (update :resource/events disj cmd)
+                  (assoc-in [::users user-id]
+                            {:email email
+                             :name name
+                             :password-hash (str "hash:" password)
+                             :status :active
+                             :created-at now})
+                  (assoc-in [::resource-invitations invitation-id :status] :accepted)
+                  (assoc-in [::resource-shares [(:resource-id invitation) user-id]]
+                            {:resource-id (:resource-id invitation)
+                             :user-id user-id
+                             :permission (:permission invitation)
+                             :status :active
+                             :created-at now})
+                  (update :notifications/outbox conj
+                          {:to (:invited-by invitation)
+                           :template :invitation-accepted
+                           :data {:resource-id (:resource-id invitation)
+                                  :user-id user-id}})))))))))
+
+(r/defproc decline-invitation
+  (fn [{:keys [:resource/events] :as db}]
+    (when-let [{:keys [invitation-id] :as cmd}
+               (take-event events :decline-invitation)]
+      (when-let [invitation (get-in db [::resource-invitations invitation-id])]
+        (when (invitation-valid? db invitation)
+          (-> db
+              (update :resource/events disj cmd)
+              (assoc-in [::resource-invitations invitation-id :status] :declined)))))))
+
+(r/defproc invitation-expires
+  (fn [{:keys [::resource-invitations :clock/now] :as db}]
+    (reduce-kv
+     (fn [acc invitation-id invitation]
+       (if (and (= :pending (:status invitation))
+                (<= (:expires-at invitation) now))
+         (assoc-in acc [::resource-invitations invitation-id :status] :expired)
+         acc))
+     db
+     resource-invitations)))
+
+(r/defproc revoke-invitation
+  (fn [{:keys [:resource/events] :as db}]
+    (when-let [{:keys [actor-id invitation-id] :as cmd}
+               (take-event events :revoke-invitation)]
+      (when-let [invitation (get-in db [::resource-invitations invitation-id])]
+        (when (and (= :pending (:status invitation))
+                   (can-admin-resource? db (:resource-id invitation) actor-id))
+          (-> db
+              (update :resource/events disj cmd)
+              (assoc-in [::resource-invitations invitation-id :status] :revoked)))))))
+
+(r/defproc change-share-permission
+  (fn [{:keys [:resource/events] :as db}]
+    (when-let [{:keys [actor-id resource-id target-user-id new-permission] :as cmd}
+               (take-event events :change-share-permission)]
+      (let [share-path [::resource-shares [resource-id target-user-id]]
+            owner-id (get-in db [::resources resource-id :owner-id])]
+        (when (and (can-admin-resource? db resource-id actor-id)
+                   (some? (get-in db share-path))
+                   (not= target-user-id owner-id)
+                   (= :active (get-in db (conj share-path :status))))
+          (-> db
+              (update :resource/events disj cmd)
+              (assoc-in (conj share-path :permission) new-permission)))))))
+
+(r/defproc revoke-share
+  (fn [{:keys [:resource/events] :as db}]
+    (when-let [{:keys [actor-id resource-id target-user-id] :as cmd}
+               (take-event events :revoke-share)]
+      (let [share-path [::resource-shares [resource-id target-user-id]]
+            owner-id (get-in db [::resources resource-id :owner-id])]
+        (when (and (can-admin-resource? db resource-id actor-id)
+                   (some? (get-in db share-path))
+                   (= :active (get-in db (conj share-path :status)))
+                   (not= target-user-id owner-id))
+          (-> db
+              (update :resource/events disj cmd)
+              (assoc-in (conj share-path :status) :revoked)
+              (update :notifications/outbox conj
+                      {:to target-user-id
+                       :template :access-revoked
+                       :data {:resource-id resource-id}})))))))
 ```
--- resource-invitation.allium
-
-config {
-    invitation_expiry: Duration = 7.days
-}
-
-------------------------------------------------------------
--- Entities
-------------------------------------------------------------
-
-entity Resource {
-    name: String
-    owner: User
-
-    -- Relationships
-    shares: ResourceShare with resource = this
-    invitations: ResourceInvitation with resource = this
-
-    -- Projections
-    active_shares: shares where status = active
-    pending_invitations: invitations where status = pending
-}
-
-entity ResourceShare {
-    resource: Resource
-    user: User
-    permission: view | edit | admin
-    status: active | revoked
-    created_at: Timestamp
-
-    -- Derived
-    can_view: permission in {view, edit, admin}
-    can_edit: permission in {edit, admin}
-    can_admin: permission = admin
-    can_invite: permission in {edit, admin}    -- editors and admins can invite
-}
-
-entity ResourceInvitation {
-    resource: Resource
-    email: String
-    permission: view | edit | admin
-    invited_by: User
-    created_at: Timestamp
-    expires_at: Timestamp
-    status: pending | accepted | declined | expired | revoked
-
-    -- Derived
-    is_valid: status = pending and expires_at > now
-}
-
-------------------------------------------------------------
--- Inviting
-------------------------------------------------------------
-
-rule InviteToResource {
-    when: InviteToResource(inviter, resource, email, permission)
-
-    let inviter_share = ResourceShare{resource: resource, user: inviter}
-    let existing_invitation = ResourceInvitation{resource: resource, email: email}
-
-    requires: inviter = resource.owner or inviter_share.can_invite
-    requires: permission in {view, edit}    -- can't invite as admin unless owner
-              or (permission = admin and inviter = resource.owner)
-    requires: not exists ResourceShare{resource: resource, user: User{email: email}}
-    requires: not exists existing_invitation or not existing_invitation.is_valid
-
-    ensures: ResourceInvitation.created(
-        resource: resource,
-        email: email,
-        permission: permission,
-        invited_by: inviter,
-        created_at: now,
-        expires_at: now + config.invitation_expiry,
-        status: pending
-    )
-    ensures: Email.created(
-        to: email,
-        template: resource_invitation,
-        data: {
-            resource: resource,
-            inviter: inviter,
-            permission: permission
-        }
-    )
-}
-
-------------------------------------------------------------
--- Accepting (existing user)
-------------------------------------------------------------
-
-rule AcceptInvitationExistingUser {
-    when: ExistingUserAcceptsInvitation(invitation, user)
-
-    requires: invitation.is_valid
-    requires: user.email = invitation.email
-
-    ensures: invitation.status = accepted
-    ensures: ResourceShare.created(
-        resource: invitation.resource,
-        user: user,
-        permission: invitation.permission,
-        status: active,
-        created_at: now
-    )
-    ensures: Notification.created(
-        to: invitation.invited_by,
-        template: invitation_accepted,
-        data: { resource: invitation.resource, user: user }
-    )
-}
-
-------------------------------------------------------------
--- Accepting (new user - triggers signup flow)
-------------------------------------------------------------
-
-rule AcceptInvitationNewUser {
-    when: NewUserAcceptsInvitation(invitation, email, name, password)
-
-    requires: invitation.is_valid
-    requires: email = invitation.email
-    requires: not exists User{email: email}
-
-    ensures:
-        let user = User.created(
-            email: email,
-            name: name,
-            password_hash: hash(password),
-            status: active
-        )
-        invitation.status = accepted
-        ResourceShare.created(
-            resource: invitation.resource,
-            user: user,
-            permission: invitation.permission,
-            status: active,
-            created_at: now
-        )
-        Notification.created(
-            to: invitation.invited_by,
-            template: invitation_accepted,
-            data: { resource: invitation.resource, user: user }
-        )
-}
-
-------------------------------------------------------------
--- Declining and expiring
-------------------------------------------------------------
-
-rule DeclineInvitation {
-    when: DeclineInvitation(invitation)
-
-    requires: invitation.is_valid
-
-    ensures: invitation.status = declined
-}
-
-rule InvitationExpires {
-    when: invitation: ResourceInvitation.expires_at <= now
-
-    requires: invitation.status = pending
-
-    ensures: invitation.status = expired
-}
-
-rule RevokeInvitation {
-    when: RevokeInvitation(actor, invitation)
-
-    let actor_share = ResourceShare{resource: invitation.resource, user: actor}
-
-    requires: invitation.status = pending
-    requires: actor = invitation.resource.owner or actor_share.can_admin
-
-    ensures: invitation.status = revoked
-}
-
-------------------------------------------------------------
--- Managing shares
-------------------------------------------------------------
-
-rule ChangeSharePermission {
-    when: ChangeSharePermission(actor, share, new_permission)
-
-    let actor_share = ResourceShare{resource: share.resource, user: actor}
-
-    requires: actor = share.resource.owner or actor_share.can_admin
-    requires: share.user != share.resource.owner    -- can't change owner
-    requires: share.status = active
-
-    ensures: share.permission = new_permission
-}
-
-rule RevokeShare {
-    when: RevokeShare(actor, share)
-
-    let actor_share = ResourceShare{resource: share.resource, user: actor}
-
-    requires: actor = share.resource.owner or actor_share.can_admin
-    requires: share.user != share.resource.owner
-    requires: share.status = active
-
-    ensures: share.status = revoked
-    ensures: Notification.created(
-        to: share.user,
-        template: access_revoked,
-        data: { resource: share.resource }
-    )
-}
-
-------------------------------------------------------------
--- Surfaces
-------------------------------------------------------------
-
-surface ResourceSharing {
-    facing sharer: User
-
-    context resource: Resource
-
-    let share = ResourceShare{resource: resource, user: sharer}
-
-    exposes:
-        resource.active_shares
-        resource.pending_invitations
-
-    provides:
-        InviteToResource(sharer, resource, email, permission)
-            when sharer = resource.owner or share.can_invite
-        for invitation in resource.pending_invitations:
-            RevokeInvitation(sharer, invitation)
-                when sharer = resource.owner or share.can_admin
-        for s in resource.active_shares:
-            ChangeSharePermission(sharer, s, new_permission)
-                when sharer = resource.owner or share.can_admin
-            RevokeShare(sharer, s)
-                when sharer = resource.owner or share.can_admin
-
-    guarantee: OwnerCannotBeRevoked
-        -- The resource owner's access cannot be revoked or downgraded.
-}
-
-surface InvitationResponse {
-    facing recipient: User
-
-    context invitation: ResourceInvitation where email = recipient.email
-
-    exposes:
-        invitation.resource.name
-        invitation.permission
-        invitation.invited_by.name
-        invitation.expires_at
-        invitation.is_valid
-
-    provides:
-        ExistingUserAcceptsInvitation(invitation, recipient)
-            when invitation.is_valid
-        DeclineInvitation(invitation)
-            when invitation.is_valid
-}
-```
-
-**Key language features shown:**
-- Complex permission logic in `requires`
-- Distinct trigger names for different parameter shapes (`ExistingUserAcceptsInvitation` vs `NewUserAcceptsInvitation`)
-- Invitation lifecycle (pending → accepted/declined/expired/revoked)
-- Checking existence with `exists` keyword
-- Permission escalation prevention (`can't invite as admin unless owner`)
-- Surfaces for both resource owner and invitation recipient boundaries
-- Conditional `provides` with `for` iteration over collections
-
----
 
 ## Pattern 4: Soft Delete & Restore
 
-**Demonstrates:** Simple state machines, projections that filter deleted items, retention policies
+File: `soft-delete.model.clj`
 
-This pattern implements soft delete where items appear deleted but can be restored within a retention period.
+```clojure
+(ns patterns.soft-delete.model
+  (:require [recife.core :as r]))
 
+(def global
+  {::config {:retention-period-ms (* 30 24 60 60 1000)}
+   ::documents {}
+   ::workspace-memberships {}
+   :document/events #{}
+   :clock/now 0})
+
+(defn take-event [events event-type]
+  (first (filter #(= event-type (:type %)) events)))
+
+(defn can-admin? [db workspace-id user-id]
+  (true? (get-in db [::workspace-memberships [workspace-id user-id] :can-admin])))
+
+(defn can-restore? [db document]
+  (and (= :deleted (:status document))
+       (some? (:deleted-at document))
+       (> (+ (:deleted-at document)
+             (get-in db [::config :retention-period-ms]))
+          (:clock/now db))))
+
+(r/defproc delete-document
+  (fn [{:keys [:document/events] :as db}]
+    (when-let [{:keys [actor-id document-id] :as cmd}
+               (take-event events :delete-document)]
+      (when-let [document (get-in db [::documents document-id])]
+        (when (and (= :active (:status document))
+                   (or (= actor-id (:created-by document))
+                       (can-admin? db (:workspace-id document) actor-id)))
+          (-> db
+              (update :document/events disj cmd)
+              (assoc-in [::documents document-id :status] :deleted)
+              (assoc-in [::documents document-id :deleted-at] (:clock/now db))
+              (assoc-in [::documents document-id :deleted-by] actor-id)))))))
+
+(r/defproc restore-document
+  (fn [{:keys [:document/events] :as db}]
+    (when-let [{:keys [actor-id document-id] :as cmd}
+               (take-event events :restore-document)]
+      (when-let [document (get-in db [::documents document-id])]
+        (when (and (can-restore? db document)
+                   (or (= actor-id (:deleted-by document))
+                       (can-admin? db (:workspace-id document) actor-id)))
+          (-> db
+              (update :document/events disj cmd)
+              (assoc-in [::documents document-id :status] :active)
+              (assoc-in [::documents document-id :deleted-at] nil)
+              (assoc-in [::documents document-id :deleted-by] nil)))))))
+
+(r/defproc permanently-delete
+  (fn [{:keys [:document/events] :as db}]
+    (when-let [{:keys [actor-id document-id] :as cmd}
+               (take-event events :permanently-delete)]
+      (when-let [document (get-in db [::documents document-id])]
+        (when (and (= :deleted (:status document))
+                   (can-admin? db (:workspace-id document) actor-id))
+          (-> db
+              (update :document/events disj cmd)
+              (update ::documents dissoc document-id)))))))
+
+(r/defproc retention-expires
+  (fn [{:keys [::documents :clock/now] :as db}]
+    (reduce-kv
+     (fn [acc document-id document]
+       (if (and (= :deleted (:status document))
+                (some? (:deleted-at document))
+                (<= (+ (:deleted-at document)
+                       (get-in db [::config :retention-period-ms]))
+                    now))
+         (update acc ::documents dissoc document-id)
+         acc))
+     db
+     documents)))
+
+(r/defproc empty-trash
+  (fn [{:keys [:document/events ::documents] :as db}]
+    (when-let [{:keys [actor-id workspace-id] :as cmd}
+               (take-event events :empty-trash)]
+      (when (can-admin? db workspace-id actor-id)
+        (-> db
+            (update :document/events disj cmd)
+            (assoc ::documents
+                   (into {}
+                         (remove (fn [[_ document]]
+                                   (and (= workspace-id (:workspace-id document))
+                                        (= :deleted (:status document)))))
+                         documents)))))))
+
+(r/defproc restore-all
+  (fn [{:keys [:document/events ::documents] :as db}]
+    (when-let [{:keys [actor-id workspace-id] :as cmd}
+               (take-event events :restore-all-deleted)]
+      (when (can-admin? db workspace-id actor-id)
+        (-> db
+            (update :document/events disj cmd)
+            (assoc ::documents
+                   (reduce-kv
+                    (fn [acc document-id document]
+                      (if (and (= workspace-id (:workspace-id document))
+                               (can-restore? db document))
+                        (assoc acc document-id
+                               (-> document
+                                   (assoc :status :active)
+                                   (assoc :deleted-at nil)
+                                   (assoc :deleted-by nil)))
+                        (assoc acc document-id document)))
+                    {}
+                    documents)))))))
 ```
--- soft-delete.allium
-
-config {
-    retention_period: Duration = 30.days
-}
-
-------------------------------------------------------------
--- Entities
-------------------------------------------------------------
-
-entity Document {
-    workspace: Workspace
-    title: String
-    content: String
-    created_by: User
-    created_at: Timestamp
-    status: active | deleted
-    deleted_at: Timestamp?
-    deleted_by: User?
-
-    -- Derived
-    is_active: status = active
-    retention_expires_at: deleted_at + config.retention_period
-    can_restore: status = deleted and retention_expires_at > now
-}
-
--- Extend Workspace to show how projections filter
-entity Workspace {
-    name: String
-
-    -- Relationships
-    all_documents: Document with workspace = this
-
-    -- Projections (what users typically see)
-    documents: all_documents where status = active
-    deleted_documents: all_documents where status = deleted
-    restorable_documents: all_documents where can_restore = true
-}
-
-------------------------------------------------------------
--- Rules
-------------------------------------------------------------
-
-rule DeleteDocument {
-    when: DeleteDocument(actor, document)
-
-    let membership = WorkspaceMembership{user: actor, workspace: document.workspace}
-
-    requires: document.status = active
-    requires: actor = document.created_by or membership.can_admin
-
-    ensures: document.status = deleted
-    ensures: document.deleted_at = now
-    ensures: document.deleted_by = actor
-}
-
-rule RestoreDocument {
-    when: RestoreDocument(actor, document)
-
-    let membership = WorkspaceMembership{user: actor, workspace: document.workspace}
-
-    requires: document.can_restore
-    requires: actor = document.deleted_by or membership.can_admin
-
-    ensures: document.status = active
-    ensures: document.deleted_at = null
-    ensures: document.deleted_by = null
-}
-
-rule PermanentlyDelete {
-    when: PermanentlyDelete(actor, document)
-
-    let membership = WorkspaceMembership{user: actor, workspace: document.workspace}
-
-    requires: document.status = deleted
-    requires: membership.can_admin
-
-    ensures: not exists document    -- actually removed
-}
-
-rule RetentionExpires {
-    when: document: Document.retention_expires_at <= now
-
-    requires: document.status = deleted
-
-    ensures: not exists document
-}
-
-------------------------------------------------------------
--- Bulk operations
-------------------------------------------------------------
-
-rule EmptyTrash {
-    when: EmptyTrash(actor, workspace)
-
-    let membership = WorkspaceMembership{user: actor, workspace: workspace}
-
-    requires: membership.can_admin
-
-    ensures:
-        for d in workspace.deleted_documents:
-            not exists d
-}
-
-rule RestoreAll {
-    when: RestoreAllDeleted(actor, workspace)
-
-    let membership = WorkspaceMembership{user: actor, workspace: workspace}
-
-    requires: membership.can_admin
-
-    ensures:
-        for d in workspace.restorable_documents:
-            d.status = active
-            d.deleted_at = null
-            d.deleted_by = null
-}
-```
-
-**Key language features shown:**
-- `status` field with clear lifecycle
-- Nullable timestamps (`deleted_at: Timestamp?`)
-- Projections filtering by status (`documents: all_documents where status = active`)
-- Derived values using config (`retention_expires_at: deleted_at + config.retention_period`)
-- Temporal trigger for automatic cleanup (`when: document: Document.retention_expires_at <= now`)
-- `not exists` for permanent removal, as distinct from soft delete
-- Bulk operations with `for` iteration
-
----
 
 ## Pattern 5: Notification Preferences & Digests
 
-**Demonstrates:** Sum types for notification variants, user preferences affecting rule behaviour, digest batching, temporal triggers, surfaces
+File: `notifications.model.clj`
 
-This pattern handles in-app notifications with user-controlled email preferences and digest batching. It uses sum types to model different notification kinds, each carrying its own contextual data rather than pre-computed strings.
+```clojure
+(ns patterns.notifications.model
+  (:require [recife.core :as r]))
 
+(def global
+  {::users {}
+   ::notification-settings {}
+   ::notifications {}
+   ::digest-batches {}
+   :notification/events #{}
+   :mail/outbox []
+   :clock/now 0})
+
+(defn take-event [events event-type]
+  (first (filter #(= event-type (:type %)) events)))
+
+(defn next-id [prefix m]
+  (keyword (str prefix "-" (inc (count m)))))
+
+(defn preference-for [settings kind]
+  (case kind
+    :mention (:email-on-mention settings)
+    :reply (:email-on-comment settings)
+    :share (:email-on-share settings)
+    :assignment (:email-on-assignment settings)
+    :immediately))
+
+(defn create-notification [db user-id kind attrs]
+  (let [notification-id (next-id "notification" (::notifications db))
+        settings (get-in db [::notification-settings user-id])
+        preference (preference-for settings kind)
+        email-status (if (= :never preference) :skipped :pending)]
+    (assoc-in db [::notifications notification-id]
+              (merge {:id notification-id
+                      :user-id user-id
+                      :kind kind
+                      :created-at (:clock/now db)
+                      :status :unread
+                      :email-status email-status}
+                     attrs))))
+
+(r/defproc create-mention-notification
+  (fn [{:keys [:notification/events] :as db}]
+    (when-let [{:keys [user-id comment-id mentioned-by] :as cmd}
+               (take-event events :user-mentioned)]
+      (when (not= user-id mentioned-by)
+        (-> db
+            (update :notification/events disj cmd)
+            (create-notification user-id :mention
+                                 {:comment-id comment-id
+                                  :mentioned-by mentioned-by}))))))
+
+(r/defproc create-reply-notification
+  (fn [{:keys [:notification/events] :as db}]
+    (when-let [{:keys [original-author-id reply-id original-comment-id replied-by] :as cmd}
+               (take-event events :comment-replied)]
+      (when (not= original-author-id replied-by)
+        (-> db
+            (update :notification/events disj cmd)
+            (create-notification original-author-id :reply
+                                 {:reply-id reply-id
+                                  :original-comment-id original-comment-id
+                                  :replied-by replied-by}))))))
+
+(r/defproc create-share-notification
+  (fn [{:keys [:notification/events] :as db}]
+    (when-let [{:keys [user-id resource-id shared-by permission] :as cmd}
+               (take-event events :resource-shared)]
+      (when (not= user-id shared-by)
+        (-> db
+            (update :notification/events disj cmd)
+            (create-notification user-id :share
+                                 {:resource-id resource-id
+                                  :shared-by shared-by
+                                  :permission permission}))))))
+
+(r/defproc create-assignment-notification
+  (fn [{:keys [:notification/events] :as db}]
+    (when-let [{:keys [user-id task-id assigned-by] :as cmd}
+               (take-event events :task-assigned)]
+      (when (not= user-id assigned-by)
+        (-> db
+            (update :notification/events disj cmd)
+            (create-notification user-id :assignment
+                                 {:task-id task-id
+                                  :assigned-by assigned-by}))))))
+
+(r/defproc create-system-notification
+  (fn [{:keys [:notification/events] :as db}]
+    (when-let [{:keys [user-id title body link] :as cmd}
+               (take-event events :system-notification-triggered)]
+      (-> db
+          (update :notification/events disj cmd)
+          (create-notification user-id :system
+                               {:title title :body body :link link
+                                :email-status :pending})))))
+
+(r/defproc send-immediate-email
+  (fn [{:keys [::notifications] :as db}]
+    (when-let [[notification-id notification]
+               (first (filter
+                       (fn [[_ notification]]
+                         (let [settings (get-in db [::notification-settings (:user-id notification)])
+                               preference (preference-for settings (:kind notification))]
+                           (and (= :pending (:email-status notification))
+                                (= :immediately preference))))
+                       notifications))]
+      (-> db
+          (assoc-in [::notifications notification-id :email-status] :sent)
+          (update :mail/outbox conj
+                  {:to (get-in db [::users (:user-id notification) :email])
+                   :template :notification-immediate
+                   :data {:notification-id notification-id}})))))
+
+(r/defproc mark-as-read
+  (fn [{:keys [:notification/events] :as db}]
+    (when-let [{:keys [user-id notification-id] :as cmd}
+               (take-event events :mark-notification-read)]
+      (when (and (= user-id (get-in db [::notifications notification-id :user-id]))
+                 (= :unread (get-in db [::notifications notification-id :status])))
+        (-> db
+            (update :notification/events disj cmd)
+            (assoc-in [::notifications notification-id :status] :read))))))
+
+(r/defproc mark-all-as-read
+  (fn [{:keys [:notification/events ::notifications] :as db}]
+    (when-let [{:keys [user-id] :as cmd} (take-event events :mark-all-notifications-read)]
+      (-> db
+          (update :notification/events disj cmd)
+          (assoc ::notifications
+                 (reduce-kv
+                  (fn [acc notification-id notification]
+                    (if (and (= user-id (:user-id notification))
+                             (= :unread (:status notification)))
+                      (assoc acc notification-id (assoc notification :status :read))
+                      (assoc acc notification-id notification)))
+                  {}
+                  notifications))))))
+
+(r/defproc archive-notification
+  (fn [{:keys [:notification/events] :as db}]
+    (when-let [{:keys [user-id notification-id] :as cmd}
+               (take-event events :archive-notification)]
+      (when (= user-id (get-in db [::notifications notification-id :user-id]))
+        (-> db
+            (update :notification/events disj cmd)
+            (assoc-in [::notifications notification-id :status] :archived))))))
+
+(r/defproc create-daily-digest
+  (fn [{:keys [::users ::notifications :clock/now] :as db}]
+    (reduce-kv
+     (fn [acc user-id user]
+       (let [settings (get-in acc [::notification-settings user-id])
+             pending (filter (fn [[_ notification]]
+                               (and (= user-id (:user-id notification))
+                                    (= :pending (:email-status notification))
+                                    (>= (:created-at notification)
+                                        (- now (* 24 60 60 1000)))))
+                             (::notifications acc))]
+         (if (and (:digest-enabled settings)
+                  (some? (:next-digest-at user))
+                  (<= (:next-digest-at user) now)
+                  (seq pending))
+           (let [batch-id (next-id "digest" (::digest-batches acc))]
+             (let [acc' (-> acc
+                            (assoc-in [::digest-batches batch-id]
+                                      {:user-id user-id
+                                       :notification-ids (mapv first pending)
+                                       :created-at now
+                                       :sent-at nil
+                                       :status :pending})
+                            (assoc-in [::users user-id :next-digest-at]
+                                      (+ now (* 24 60 60 1000))))]
+               (reduce (fn [x [notification-id _]]
+                         (assoc-in x [::notifications notification-id :email-status] :digested))
+                       acc'
+                       pending)))
+           acc)))
+     db
+     users)))
+
+(r/defproc send-digest
+  (fn [{:keys [::digest-batches] :as db}]
+    (when-let [[batch-id batch]
+               (first (filter (fn [[_ batch]]
+                                (and (= :pending (:status batch))
+                                     (seq (:notification-ids batch))))
+                              digest-batches))]
+      (-> db
+          (assoc-in [::digest-batches batch-id :status] :sent)
+          (assoc-in [::digest-batches batch-id :sent-at] (:clock/now db))
+          (update :mail/outbox conj
+                  {:to (get-in db [::users (:user-id batch) :email])
+                   :template :daily-digest
+                   :data {:notification-ids (:notification-ids batch)
+                          :unread-count (count (filter (fn [[_ notification]]
+                                                         (and (= (:user-id batch) (:user-id notification))
+                                                              (= :unread (:status notification))))
+                                                       (::notifications db)))}})))))
+
+(r/defproc update-notification-preferences
+  (fn [{:keys [:notification/events] :as db}]
+    (when-let [{:keys [user-id preferences] :as cmd}
+               (take-event events :update-preferences)]
+      (-> db
+          (update :notification/events disj cmd)
+          (assoc-in [::notification-settings user-id :email-on-mention] (:mention preferences))
+          (assoc-in [::notification-settings user-id :email-on-comment] (:comment preferences))
+          (assoc-in [::notification-settings user-id :email-on-share] (:share preferences))
+          (assoc-in [::notification-settings user-id :email-on-assignment] (:assignment preferences))
+          (assoc-in [::notification-settings user-id :digest-enabled] (:digest-enabled preferences))
+          (assoc-in [::notification-settings user-id :digest-day-of-week] (:digest-days preferences))))))
 ```
--- notifications.allium
-
-------------------------------------------------------------
--- Entities
-------------------------------------------------------------
-
-entity User {
-    email: String
-    name: String
-    next_digest_at: Timestamp?
-
-    -- Relationships
-    notification_setting: NotificationSetting with user = this
-    notifications: Notification with user = this
-
-    -- Projections
-    unread_notifications: notifications where status = unread
-    pending_email_notifications: notifications where email_status = pending
-    recent_pending_notifications: notifications where email_status = pending and created_at >= now - 24.hours
-}
-
-entity NotificationSetting {
-    user: User
-
-    -- Per-type email preferences
-    email_on_mention: immediately | daily_digest | never
-    email_on_comment: immediately | daily_digest | never
-    email_on_share: immediately | daily_digest | never
-    email_on_assignment: immediately | daily_digest | never
-
-    -- Global settings
-    digest_enabled: Boolean
-    digest_day_of_week: Set<DayOfWeek>    -- domain type; define as enum in your spec
-}
-
-------------------------------------------------------------
--- Notification Sum Type
-------------------------------------------------------------
-
--- Base notification entity with shared fields
-entity Notification {
-    user: User
-    created_at: Timestamp
-    status: unread | read | archived
-    email_status: pending | sent | skipped | digested
-    kind: MentionNotification | ReplyNotification | ShareNotification |
-          AssignmentNotification | SystemNotification
-
-    -- Derived
-    is_unread: status = unread
-}
-
--- Someone @mentioned the user in a comment
-variant MentionNotification : Notification {
-    comment: Comment
-    mentioned_by: User
-}
-
--- Someone replied to the user's comment
-variant ReplyNotification : Notification {
-    reply: Comment              -- the new reply
-    original_comment: Comment   -- the user's comment being replied to
-    replied_by: User
-}
-
--- Someone shared a resource with the user
-variant ShareNotification : Notification {
-    resource: Resource
-    shared_by: User
-    permission: view | edit | admin
-}
-
--- Someone assigned a task to the user
-variant AssignmentNotification : Notification {
-    task: Task
-    assigned_by: User
-}
-
--- System-generated notification (catch-all for non-structured notifications)
-variant SystemNotification : Notification {
-    title: String
-    body: String
-    link: String?
-}
-
-------------------------------------------------------------
--- Supporting Entities
-------------------------------------------------------------
-
-entity DigestBatch {
-    user: User
-    notifications: Set<Notification>
-    created_at: Timestamp
-    sent_at: Timestamp?
-    status: pending | sent | failed
-}
-
-------------------------------------------------------------
--- Creating notifications (type-specific rules)
-------------------------------------------------------------
-
-rule CreateMentionNotification {
-    when: UserMentioned(user, comment, mentioned_by)
-
-    let settings = user.notification_setting
-
-    requires: user != mentioned_by    -- don't notify self
-
-    ensures: MentionNotification.created(
-        user: user,
-        comment: comment,
-        mentioned_by: mentioned_by,
-        created_at: now,
-        status: unread,
-        email_status: if settings.email_on_mention = never: skipped else: pending
-    )
-}
-
-rule CreateReplyNotification {
-    when: CommentReplied(original_author, reply, original_comment)
-
-    let settings = original_author.notification_setting
-
-    requires: original_author != reply.author    -- don't notify self
-
-    ensures: ReplyNotification.created(
-        user: original_author,
-        reply: reply,
-        original_comment: original_comment,
-        replied_by: reply.author,
-        created_at: now,
-        status: unread,
-        email_status: if settings.email_on_comment = never: skipped else: pending
-    )
-}
-
-rule CreateShareNotification {
-    when: ResourceShared(user, resource, shared_by, permission)
-
-    let settings = user.notification_setting
-
-    requires: user != shared_by    -- don't notify self
-
-    ensures: ShareNotification.created(
-        user: user,
-        resource: resource,
-        shared_by: shared_by,
-        permission: permission,
-        created_at: now,
-        status: unread,
-        email_status: if settings.email_on_share = never: skipped else: pending
-    )
-}
-
-rule CreateAssignmentNotification {
-    when: TaskAssigned(user, task, assigned_by)
-
-    let settings = user.notification_setting
-
-    requires: user != assigned_by    -- don't notify self
-
-    ensures: AssignmentNotification.created(
-        user: user,
-        task: task,
-        assigned_by: assigned_by,
-        created_at: now,
-        status: unread,
-        email_status: if settings.email_on_assignment = never: skipped else: pending
-    )
-}
-
-rule CreateSystemNotification {
-    when: SystemNotificationTriggered(user, title, body, link)
-
-    ensures: SystemNotification.created(
-        user: user,
-        title: title,
-        body: body,
-        link: link,
-        created_at: now,
-        status: unread,
-        email_status: pending
-    )
-}
-
-------------------------------------------------------------
--- Immediate email sending
-------------------------------------------------------------
-
-rule SendImmediateEmail {
-    when: notification: Notification.created
-
-    let settings = notification.user.notification_setting
-    let preference =
-        if notification.kind = MentionNotification: settings.email_on_mention
-        else if notification.kind = ReplyNotification: settings.email_on_comment
-        else if notification.kind = ShareNotification: settings.email_on_share
-        else if notification.kind = AssignmentNotification: settings.email_on_assignment
-        else: immediately    -- system notifications send immediately by default
-
-    requires: notification.email_status = pending
-    requires: preference = immediately
-
-    ensures: Email.created(
-        to: notification.user.email,
-        template: notification_immediate,
-        data: { notification: notification }
-    )
-    ensures: notification.email_status = sent
-}
-
-------------------------------------------------------------
--- Reading notifications
-------------------------------------------------------------
-
-rule MarkAsRead {
-    when: MarkNotificationRead(user, notification)
-
-    requires: notification.user = user
-    requires: notification.status = unread
-
-    ensures: notification.status = read
-}
-
-rule MarkAllAsRead {
-    when: MarkAllNotificationsRead(user)
-
-    ensures:
-        for n in user.unread_notifications:
-            n.status = read
-}
-
-rule ArchiveNotification {
-    when: ArchiveNotification(user, notification)
-
-    requires: notification.user = user
-
-    ensures: notification.status = archived
-}
-
-------------------------------------------------------------
--- Daily digest
-------------------------------------------------------------
-
-rule CreateDailyDigest {
-    when: user: User.next_digest_at <= now
-
-    requires: user.notification_setting.digest_enabled
-
-    let pending = user.recent_pending_notifications
-
-    requires: pending.count > 0
-
-    ensures: DigestBatch.created(
-        user: user,
-        notifications: pending,
-        created_at: now,
-        status: pending
-    )
-    ensures:
-        for n in pending:
-            n.email_status = digested
-    ensures: user.next_digest_at = next_digest_time(user)    -- black box; uses digest_day_of_week
-}
-
-rule SendDigest {
-    when: batch: DigestBatch.created
-
-    requires: batch.status = pending
-    requires: batch.notifications.count > 0
-
-    ensures: Email.created(
-        to: batch.user.email,
-        template: daily_digest,
-        data: {
-            notifications: batch.notifications,
-            unread_count: batch.user.unread_notifications.count
-        }
-    )
-    ensures: batch.status = sent
-    ensures: batch.sent_at = now
-}
-
-------------------------------------------------------------
--- Preference updates
-------------------------------------------------------------
-
-rule UpdateNotificationPreferences {
-    when: UpdatePreferences(user, preferences)
-
-    let settings = user.notification_setting
-
-    ensures: settings.email_on_mention = preferences.mention
-    ensures: settings.email_on_comment = preferences.comment
-    ensures: settings.email_on_share = preferences.share
-    ensures: settings.email_on_assignment = preferences.assignment
-    ensures: settings.digest_enabled = preferences.digest_enabled
-    ensures: settings.digest_day_of_week = preferences.digest_days
-}
-
-------------------------------------------------------------
--- Surfaces
-------------------------------------------------------------
-
-surface NotificationCentre {
-    facing user: User
-
-    exposes:
-        user.unread_notifications
-        user.unread_notifications.count
-        user.notifications
-
-    provides:
-        for notification in user.unread_notifications:
-            MarkNotificationRead(user, notification)
-        MarkAllNotificationsRead(user)
-            when user.unread_notifications.count > 0
-        for notification in user.notifications:
-            ArchiveNotification(user, notification)
-
-    related:
-        NotificationPreferences(user)
-}
-
-surface NotificationPreferences {
-    facing user: User
-
-    context settings: NotificationSetting where user = user
-
-    exposes:
-        settings.email_on_mention
-        settings.email_on_comment
-        settings.email_on_share
-        settings.email_on_assignment
-        settings.digest_enabled
-        settings.digest_day_of_week
-
-    provides:
-        UpdatePreferences(user, preferences)
-}
-```
-
-**Key language features shown:**
-- **Sum types**: `kind: MentionNotification | ReplyNotification | ...` declares notification variants
-- **Variant declarations**: Each notification kind uses `variant X : Notification` syntax
-- **Variant-specific creation rules**: Each variant has its own creation rule with appropriate fields
-- **Exhaustive kind checking**: `SendImmediateEmail` handles all variants explicitly
-- User preferences stored as entity
-- Temporal trigger for per-user digest scheduling (`when: user: User.next_digest_at <= now`)
-- Digest batching with temporal trigger
-- Surfaces with `related` clause linking notification centre to preferences
-
-**Why sum types here?**
-
-The previous approach used pre-computed `title`, `body`, and `link` strings:
-```
-Notification.created(
-    type: mention,
-    title: "{author} mentioned you",
-    body: truncate(comment.body, 100),
-    link: comment.parent.url
-)
-```
-
-With sum types, each notification carries its actual entity references:
-```
-MentionNotification.created(
-    comment: comment,
-    mentioned_by: author
-)
-```
-
-This is better because:
-1. **Rich queries**: "Show all notifications about this document" queries the actual relationships
-2. **Type safety**: Creating a `MentionNotification` requires a `comment` - you can't forget it
-3. **Flexible rendering**: Display logic can access full entity data, not just truncated strings
-4. **Consistency**: If a user's name changes, notification titles reflect the current name
-
----
 
 ## Pattern 6: Usage Limits & Quotas
 
-**Demonstrates:** Limit checks in `requires`, metered resources, plan tiers, overage handling, surfaces
+File: `usage-limits.model.clj`
 
-This pattern handles SaaS usage limits: different plans have different quotas, and usage is tracked and enforced.
+```clojure
+(ns patterns.usage-limits.model
+  (:require [recife.core :as r]))
 
+(def global
+  {::plans {}
+   ::workspaces {}
+   ::workspace-usage {}
+   ::workspace-memberships {}
+   ::documents {}
+   ::usage-events []
+   :usage/events #{}
+   :notifications/outbox []
+   :mail/outbox []
+   :api/responses []
+   :clock/now 0})
+
+(defn take-event [events event-type]
+  (first (filter #(= event-type (:type %)) events)))
+
+(defn unlimited? [v]
+  (nil? v))
+
+(defn workspace-doc-count [db workspace-id]
+  (->> (::documents db)
+       vals
+       (filter #(= workspace-id (:workspace-id %)))
+       count))
+
+(defn workspace-member-count [db workspace-id]
+  (->> (::workspace-memberships db)
+       keys
+       (filter #(= workspace-id (first %)))
+       count))
+
+(defn workspace-plan [db workspace-id]
+  (get-in db [::plans (get-in db [::workspaces workspace-id :plan-id])]))
+
+(defn can-add-document? [db workspace-id]
+  (let [max-documents (:max-documents (workspace-plan db workspace-id))]
+    (or (unlimited? max-documents)
+        (< (workspace-doc-count db workspace-id) max-documents))))
+
+(defn can-add-member? [db workspace-id]
+  (let [max-members (:max-team-members (workspace-plan db workspace-id))]
+    (or (unlimited? max-members)
+        (< (workspace-member-count db workspace-id) max-members))))
+
+(defn can-use-feature? [db workspace-id feature]
+  (contains? (:features (workspace-plan db workspace-id)) feature))
+
+(defn over-api-quota? [db workspace-id]
+  (let [max-requests (:max-api-requests-per-day (workspace-plan db workspace-id))
+        used (get-in db [::workspace-usage workspace-id :api-requests-today] 0)]
+    (and (some? max-requests)
+         (>= used max-requests))))
+
+(r/defproc create-document
+  (fn [{:keys [:usage/events] :as db}]
+    (when-let [{:keys [workspace-id user-id title] :as cmd}
+               (take-event events :create-document)]
+      (when (can-add-document? db workspace-id)
+        (let [document-id (keyword (str "document-" (inc (count (::documents db)))))
+              now (:clock/now db)]
+          (-> db
+              (update :usage/events disj cmd)
+              (assoc-in [::documents document-id]
+                        {:workspace-id workspace-id
+                         :created-by user-id
+                         :title title
+                         :created-at now})
+              (update ::usage-events conj
+                      {:workspace-id workspace-id
+                       :type :document-created
+                       :amount 1
+                       :recorded-at now})))))))
+
+(r/defproc create-document-limit-reached
+  (fn [{:keys [:usage/events] :as db}]
+    (when-let [{:keys [workspace-id user-id] :as cmd}
+               (take-event events :create-document)]
+      (when (not (can-add-document? db workspace-id))
+        (let [plan (workspace-plan db workspace-id)]
+          (-> db
+              (update :usage/events disj cmd)
+              (update :notifications/outbox conj
+                      {:user-id user-id
+                       :about :limit-reached
+                       :data {:limit-type :documents
+                              :current (workspace-doc-count db workspace-id)
+                              :max (:max-documents plan)}})))))))
+
+(r/defproc add-team-member
+  (fn [{:keys [:usage/events] :as db}]
+    (when-let [{:keys [actor-id workspace-id new-member-id role] :as cmd}
+               (take-event events :add-member)]
+      (when (and (can-add-member? db workspace-id)
+                 (true? (get-in db [::workspace-memberships [workspace-id actor-id] :can-admin])))
+        (let [now (:clock/now db)]
+          (-> db
+              (update :usage/events disj cmd)
+              (assoc-in [::workspace-memberships [workspace-id new-member-id]]
+                        {:workspace-id workspace-id
+                         :user-id new-member-id
+                         :role role
+                         :can-admin (= :admin role)
+                         :joined-at now})
+              (update ::usage-events conj
+                      {:workspace-id workspace-id
+                       :type :member-added
+                       :amount 1
+                       :recorded-at now})))))))
+
+(r/defproc use-feature
+  (fn [{:keys [:usage/events] :as db}]
+    (when-let [{:keys [workspace-id user-id feature] :as cmd}
+               (take-event events :use-feature)]
+      (when (can-use-feature? db workspace-id feature)
+        (-> db
+            (update :usage/events disj cmd)
+            (update :notifications/outbox conj
+                    {:user-id user-id
+                     :about :feature-used
+                     :data {:workspace-id workspace-id
+                            :feature feature}}))))))
+
+(r/defproc use-feature-not-available
+  (fn [{:keys [:usage/events] :as db}]
+    (when-let [{:keys [workspace-id user-id feature] :as cmd}
+               (take-event events :use-feature)]
+      (when (not (can-use-feature? db workspace-id feature))
+        (-> db
+            (update :usage/events disj cmd)
+            (update :notifications/outbox conj
+                    {:user-id user-id
+                     :about :feature-not-available
+                     :data {:workspace-id workspace-id
+                            :feature feature}}))))))
+
+(r/defproc record-api-request
+  (fn [{:keys [:usage/events] :as db}]
+    (when-let [{:keys [workspace-id endpoint] :as cmd}
+               (take-event events :api-request-received)]
+      (when (not (over-api-quota? db workspace-id))
+        (let [now (:clock/now db)]
+          (-> db
+              (update :usage/events disj cmd)
+              (update-in [::workspace-usage workspace-id :api-requests-today] (fnil inc 0))
+              (update ::usage-events conj
+                      {:workspace-id workspace-id
+                       :type :api-request
+                       :amount 1
+                       :endpoint endpoint
+                       :recorded-at now})))))))
+
+(r/defproc api-rate-limit-exceeded
+  (fn [{:keys [:usage/events] :as db}]
+    (when-let [{:keys [workspace-id] :as cmd}
+               (take-event events :api-request-received)]
+      (when (over-api-quota? db workspace-id)
+        (-> db
+            (update :usage/events disj cmd)
+            (update :api/responses conj
+                    {:status 429
+                     :body {:error "rate_limit_exceeded"
+                            :resets-at (get-in db [::workspace-usage workspace-id :next-reset-at])}}))))))
+
+(r/defproc reset-daily-api-usage
+  (fn [{:keys [::workspace-usage :clock/now] :as db}]
+    (reduce-kv
+     (fn [acc workspace-id usage]
+       (if (and (some? (:next-reset-at usage))
+                (<= (:next-reset-at usage) now))
+         (-> acc
+             (assoc-in [::workspace-usage workspace-id :api-requests-today] 0)
+             (assoc-in [::workspace-usage workspace-id :next-reset-at]
+                       (+ (:next-reset-at usage) (* 24 60 60 1000))))
+         acc))
+     db
+     workspace-usage)))
+
+(r/defproc upgrade-plan
+  (fn [{:keys [:usage/events] :as db}]
+    (when-let [{:keys [workspace-id new-plan-id] :as cmd}
+               (take-event events :upgrade-plan)]
+      (let [old-plan (workspace-plan db workspace-id)
+            new-plan (get-in db [::plans new-plan-id])
+            old-limit (:max-documents old-plan)
+            new-limit (:max-documents new-plan)
+            non-decreasing? (or (unlimited? new-limit)
+                                (and (some? old-limit) (<= old-limit new-limit)))]
+        (when non-decreasing?
+          (-> db
+              (update :usage/events disj cmd)
+              (assoc-in [::workspaces workspace-id :plan-id] new-plan-id)
+              (update :mail/outbox conj
+                      {:to (get-in db [::workspaces workspace-id :owner-email])
+                       :template :plan-upgraded
+                       :data {:old-plan old-plan :new-plan new-plan}})))))))
+
+(r/defproc downgrade-plan
+  (fn [{:keys [:usage/events] :as db}]
+    (when-let [{:keys [workspace-id new-plan-id] :as cmd}
+               (take-event events :downgrade-plan)]
+      (let [new-plan (get-in db [::plans new-plan-id])
+            documents-ok (or (unlimited? (:max-documents new-plan))
+                             (<= (workspace-doc-count db workspace-id)
+                                 (:max-documents new-plan)))
+            members-ok (or (unlimited? (:max-team-members new-plan))
+                           (<= (workspace-member-count db workspace-id)
+                               (:max-team-members new-plan)))
+            storage-used (get-in db [::workspace-usage workspace-id :storage-bytes-used] 0)
+            storage-ok (or (unlimited? (:max-storage-bytes new-plan))
+                           (<= storage-used (:max-storage-bytes new-plan)))]
+        (when (and documents-ok members-ok storage-ok)
+          (-> db
+              (update :usage/events disj cmd)
+              (assoc-in [::workspaces workspace-id :plan-id] new-plan-id)
+              (update :mail/outbox conj
+                      {:to (get-in db [::workspaces workspace-id :owner-email])
+                       :template :plan-downgraded
+                       :data {:new-plan new-plan}})))))))
+
+(r/defproc downgrade-blocked
+  (fn [{:keys [:usage/events] :as db}]
+    (when-let [{:keys [workspace-id] :as cmd}
+               (take-event events :downgrade-plan)]
+      (let [new-plan (get-in db [::plans (:new-plan-id cmd)])
+            over-documents (and (not (unlimited? (:max-documents new-plan)))
+                                (> (workspace-doc-count db workspace-id)
+                                   (:max-documents new-plan)))
+            over-members (and (not (unlimited? (:max-team-members new-plan)))
+                              (> (workspace-member-count db workspace-id)
+                                 (:max-team-members new-plan)))
+            over-storage (let [storage-used (get-in db [::workspace-usage workspace-id :storage-bytes-used] 0)]
+                           (and (not (unlimited? (:max-storage-bytes new-plan)))
+                                (> storage-used (:max-storage-bytes new-plan))))]
+        (when (or over-documents over-members over-storage)
+          (-> db
+              (update :usage/events disj cmd)
+              (update :notifications/outbox conj
+                      {:user-id (get-in db [::workspaces workspace-id :owner-id])
+                       :about :downgrade-blocked
+                       :data {:over-documents over-documents
+                              :over-members over-members
+                              :over-storage over-storage}})))))))
 ```
--- usage-limits.allium
-
-------------------------------------------------------------
--- Entities
-------------------------------------------------------------
-
-entity Plan {
-    name: String                    -- e.g., "free", "pro", "enterprise"
-
-    -- Limits (null = unlimited)
-    max_documents: Integer?
-    max_storage_bytes: Integer?
-    max_team_members: Integer?
-    max_api_requests_per_day: Integer?
-
-    -- Features
-    features: Set<Feature>          -- domain type; define in your spec
-
-    -- Derived
-    has_unlimited_documents: max_documents = null
-    has_unlimited_storage: max_storage_bytes = null
-    has_unlimited_members: max_team_members = null
-}
-
-entity Workspace {
-    name: String
-    owner: User
-    plan: Plan
-    api_key: String?
-
-    -- Relationships
-    documents: Document with workspace = this
-    memberships: WorkspaceMembership with workspace = this
-    usage: WorkspaceUsage with workspace = this
-
-    -- Derived checks
-    can_add_document: plan.has_unlimited_documents or documents.count < plan.max_documents
-    can_add_member: plan.has_unlimited_members or memberships.count < plan.max_team_members
-    can_use_feature(f): f in plan.features
-}
-
-entity WorkspaceUsage {
-    workspace: Workspace
-    storage_bytes_used: Integer
-    api_requests_today: Integer
-    next_reset_at: Timestamp
-
-    -- Derived (null when plan has no limit)
-    api_requests_remaining:
-        workspace.plan.max_api_requests_per_day - api_requests_today
-    has_api_quota: workspace.plan.max_api_requests_per_day != null
-    is_over_api_quota: has_api_quota and api_requests_remaining <= 0
-}
-
-entity UsageEvent {
-    workspace: Workspace
-    type: document_created | document_deleted | storage_added |
-          storage_removed | api_request | member_added | member_removed
-    amount: Integer
-    recorded_at: Timestamp
-}
-
-------------------------------------------------------------
--- Defaults
-------------------------------------------------------------
-
-default Plan free = {
-    name: "free",
-    max_documents: 10,
-    max_storage_bytes: 100_000_000,    -- 100MB
-    max_team_members: 3,
-    max_api_requests_per_day: 100,
-    features: { basic_editing }
-}
-
-default Plan pro = {
-    name: "pro",
-    max_documents: 1000,
-    max_storage_bytes: 10_000_000_000,  -- 10GB
-    max_team_members: 20,
-    max_api_requests_per_day: 10000,
-    features: { basic_editing, advanced_editing, api_access, integrations }
-}
-
-default Plan enterprise = {
-    name: "enterprise",
-    features: { basic_editing, advanced_editing, api_access, integrations,
-                sso, audit_log, custom_branding }
-    -- max_documents, max_storage_bytes, max_team_members,
-    -- max_api_requests_per_day all null (unlimited)
-}
-
-------------------------------------------------------------
--- Enforcing limits
-------------------------------------------------------------
-
-rule CreateDocument {
-    when: CreateDocument(user, workspace, title)
-
-    requires: workspace.can_add_document
-
-    ensures: Document.created(workspace: workspace, title: title, created_by: user)
-    ensures: UsageEvent.created(
-        workspace: workspace,
-        type: document_created,
-        amount: 1,
-        recorded_at: now
-    )
-}
-
-rule CreateDocumentLimitReached {
-    when: CreateDocument(user, workspace, title)
-
-    requires: not workspace.can_add_document
-
-    ensures: UserInformed(
-        user: user,
-        about: limit_reached,
-        data: {
-            limit_type: documents,
-            current: workspace.documents.count,
-            max: workspace.plan.max_documents,
-            upgrade_path: next_plan(workspace.plan)
-        }
-    )
-}
-
-rule AddTeamMember {
-    when: AddMember(actor, workspace, new_member, role)
-
-    requires: workspace.can_add_member
-    requires: WorkspaceMembership{user: actor, workspace: workspace}.can_admin
-
-    ensures: WorkspaceMembership.created(...)
-    ensures: UsageEvent.created(
-        workspace: workspace,
-        type: member_added,
-        amount: 1,
-        recorded_at: now
-    )
-}
-
-rule UseFeature {
-    when: UseFeature(user, workspace, feature)
-
-    requires: workspace.can_use_feature(feature)
-
-    ensures: FeatureUsed(workspace: workspace, feature: feature, by: user)
-}
-
-rule UseFeatureNotAvailable {
-    when: UseFeature(user, workspace, feature)
-
-    requires: not workspace.can_use_feature(feature)
-
-    ensures: UserInformed(
-        user: user,
-        about: feature_not_available,
-        data: {
-            feature: feature,
-            available_on: plans_with_feature(feature)
-        }
-    )
-}
-
-------------------------------------------------------------
--- API rate limiting
-------------------------------------------------------------
-
-rule RecordApiRequest {
-    when: ApiRequestReceived(workspace, endpoint)
-
-    let usage = workspace.usage
-
-    requires: not usage.is_over_api_quota
-
-    ensures: usage.api_requests_today = usage.api_requests_today + 1
-    ensures: UsageEvent.created(
-        workspace: workspace,
-        type: api_request,
-        amount: 1,
-        recorded_at: now
-    )
-}
-
-rule ApiRateLimitExceeded {
-    when: ApiRequestReceived(workspace, endpoint)
-
-    let usage = workspace.usage
-
-    requires: usage.is_over_api_quota
-
-    ensures: ApiResponse.created(
-        status: 429,
-        body: {
-            error: "rate_limit_exceeded",
-            resets_at: usage.next_reset_at
-        }
-    )
-}
-
-rule ResetDailyApiUsage {
-    when: usage: WorkspaceUsage.next_reset_at <= now
-
-    ensures: usage.api_requests_today = 0
-    ensures: usage.next_reset_at = usage.next_reset_at + 1.day
-}
-
-------------------------------------------------------------
--- Plan changes
-------------------------------------------------------------
-
-rule UpgradePlan {
-    when: UpgradePlan(workspace, new_plan)
-
-    let old_plan = workspace.plan
-
-    requires: new_plan.max_documents >= old_plan.max_documents
-              or new_plan.has_unlimited_documents
-
-    ensures: workspace.plan = new_plan
-    ensures: Email.created(
-        to: workspace.owner.email,
-        template: plan_upgraded,
-        data: { old_plan: old_plan, new_plan: new_plan }
-    )
-}
-
-rule DowngradePlan {
-    when: DowngradePlan(workspace, new_plan)
-
-    let old_plan = workspace.plan
-
-    -- Can only downgrade if under new plan's limits
-    requires: workspace.documents.count <= new_plan.max_documents
-              or new_plan.has_unlimited_documents
-    requires: workspace.memberships.count <= new_plan.max_team_members
-              or new_plan.has_unlimited_members
-    requires: workspace.usage.storage_bytes_used <= new_plan.max_storage_bytes
-              or new_plan.has_unlimited_storage
-
-    ensures: workspace.plan = new_plan
-    ensures: Email.created(
-        to: workspace.owner.email,
-        template: plan_downgraded,
-        data: { old_plan: old_plan, new_plan: new_plan }
-    )
-}
-
-rule DowngradeBlocked {
-    when: DowngradePlan(workspace, new_plan)
-
-    let over_documents =
-        workspace.documents.count > new_plan.max_documents
-        and not new_plan.has_unlimited_documents
-    let over_members =
-        workspace.memberships.count > new_plan.max_team_members
-        and not new_plan.has_unlimited_members
-    let over_storage =
-        workspace.usage.storage_bytes_used > new_plan.max_storage_bytes
-        and not new_plan.has_unlimited_storage
-
-    requires: over_documents or over_members or over_storage
-
-    ensures: UserInformed(
-        user: workspace.owner,
-        about: downgrade_blocked,
-        data: {
-            over_documents: over_documents,
-            over_members: over_members,
-            over_storage: over_storage
-        }
-    )
-}
-
-------------------------------------------------------------
--- Actors
-------------------------------------------------------------
-
-actor WorkspaceOwner {
-    within: Workspace
-    identified_by: User where this = within.owner
-}
-
-------------------------------------------------------------
--- Surfaces
-------------------------------------------------------------
-
-surface UsageDashboard {
-    facing owner: WorkspaceOwner
-
-    context workspace: Workspace
-
-    exposes:
-        workspace.plan
-        workspace.documents.count
-        workspace.plan.max_documents
-        workspace.memberships.count
-        workspace.plan.max_team_members
-        workspace.usage.storage_bytes_used
-        workspace.plan.max_storage_bytes
-        workspace.usage.api_requests_today
-        workspace.usage.api_requests_remaining
-
-    provides:
-        UpgradePlan(workspace, new_plan)
-        DowngradePlan(workspace, new_plan)
-
-    guidance:
-        -- Show progress bars for usage against limits.
-        -- Highlight when any resource is above 80% of its limit.
-}
-
-surface APIAccess {
-    facing consumer: Workspace
-
-    exposes:
-        consumer.usage.api_requests_remaining
-        consumer.plan.max_api_requests_per_day
-
-    provides:
-        ApiRequestReceived(consumer, endpoint)
-            when not consumer.usage.is_over_api_quota
-
-    guarantee: RateLimitEnforcement
-        -- Requests beyond the daily limit receive HTTP 429 with
-        -- reset time.
-}
-```
-
-**Key language features shown:**
-- Plan definitions with limits
-- Derived boolean checks for limit enforcement (`can_add_document`, `can_add_member`)
-- `requires` checking limits before actions
-- Paired rules for success/failure cases
-- Usage tracking with events
-- Temporal trigger for daily reset (`when: usage: WorkspaceUsage.next_reset_at <= now`)
-- Plan upgrade/downgrade logic with `let` binding to capture pre-mutation state
-- Feature flags (`can_use_feature(f)`)
-- Interaction surface for usage dashboard and API surface with rate limit guarantee
-
----
 
 ## Pattern 7: Comments with Mentions
 
-**Demonstrates:** Nested entities, parsing for mentions, cross-entity notifications, threading, surfaces
+File: `comments.model.clj`
 
-This pattern implements comments with @mentions, including mention parsing and notification generation.
+```clojure
+(ns patterns.comments.model
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
+            [recife.core :as r]))
 
+(def global
+  {::users {}
+   ::comments {}
+   ::comment-mentions {}
+   ::comment-reactions {}
+   :comments/events #{}
+   :notifications/events #{}
+   :notifications/outbox []
+   :clock/now 0})
+
+(defn take-event [events event-type]
+  (first (filter #(= event-type (:type %)) events)))
+
+(defn parse-mentions [body]
+  (->> (str/split body #"\\s+")
+       (filter #(str/starts-with? % "@"))
+       (map #(keyword (subs % 1)))
+       set))
+
+(defn thread-depth [db comment-id]
+  (loop [depth 0 cid comment-id]
+    (if-let [parent-id (get-in db [::comments cid :reply-to])]
+      (recur (inc depth) parent-id)
+      depth)))
+
+(r/defproc create-comment
+  (fn [{:keys [:comments/events] :as db}]
+    (when-let [{:keys [author-id parent-id body] :as cmd}
+               (take-event events :create-comment)]
+      (let [comment-id (keyword (str "comment-" (inc (count (::comments db)))))
+            mentions (parse-mentions body)
+            now (:clock/now db)]
+        (let [db'' (-> db
+                       (update :comments/events disj cmd)
+                       (assoc-in [::comments comment-id]
+                                 {:parent-id parent-id
+                                  :reply-to nil
+                                  :author-id author-id
+                                  :body body
+                                  :created-at now
+                                  :edited-at nil
+                                  :status :active}))
+              db' (reduce (fn [acc user-id]
+                            (assoc-in acc [::comment-mentions [comment-id user-id]]
+                                      {:comment-id comment-id
+                                       :user-id user-id
+                                       :notified false}))
+                          db''
+                          mentions)]
+          (reduce (fn [acc user-id]
+                    (update acc :notifications/events conj
+                            {:type :mention-created
+                             :comment-id comment-id
+                             :user-id user-id}))
+                  db'
+                  mentions))))))
+
+(r/defproc create-reply
+  (fn [{:keys [:comments/events] :as db}]
+    (when-let [{:keys [author-id parent-comment-id body] :as cmd}
+               (take-event events :create-reply)]
+      (when-let [parent-comment (get-in db [::comments parent-comment-id])]
+        (when (and (= :active (:status parent-comment))
+                   (< (thread-depth db parent-comment-id) 3))
+          (let [comment-id (keyword (str "comment-" (inc (count (::comments db)))))
+                mentions (parse-mentions body)
+                now (:clock/now db)]
+            (let [db'' (-> db
+                           (update :comments/events disj cmd)
+                           (assoc-in [::comments comment-id]
+                                     {:parent-id (:parent-id parent-comment)
+                                      :reply-to parent-comment-id
+                                      :author-id author-id
+                                      :body body
+                                      :created-at now
+                                      :edited-at nil
+                                      :status :active})
+                           (update :notifications/events conj
+                                   {:type :reply-created
+                                    :reply-id comment-id
+                                    :parent-comment-id parent-comment-id}))
+                  db' (reduce (fn [acc user-id]
+                                (assoc-in acc [::comment-mentions [comment-id user-id]]
+                                          {:comment-id comment-id
+                                           :user-id user-id
+                                           :notified false}))
+                              db''
+                              mentions)]
+              (reduce (fn [acc user-id]
+                        (update acc :notifications/events conj
+                                {:type :mention-created
+                                 :comment-id comment-id
+                                 :user-id user-id}))
+                      db'
+                      mentions))))))))
+
+(r/defproc notify-mentioned-user
+  (fn [{:keys [:notifications/events] :as db}]
+    (when-let [{:keys [comment-id user-id] :as cmd}
+               (take-event events :mention-created)]
+      (let [mention-path [::comment-mentions [comment-id user-id]]
+            author-id (get-in db [::comments comment-id :author-id])]
+        (when (and (not= user-id author-id)
+                   (not (true? (get-in db (conj mention-path :notified)))))
+          (-> db
+              (update :notifications/events disj cmd)
+              (assoc-in (conj mention-path :notified) true)
+              (update :notifications/outbox conj
+                      {:to user-id
+                       :type :mention
+                       :comment-id comment-id
+                       :mentioned-by author-id})))))))
+
+(r/defproc notify-comment-author-of-reply
+  (fn [{:keys [:notifications/events] :as db}]
+    (when-let [{:keys [reply-id parent-comment-id] :as cmd}
+               (take-event events :reply-created)]
+      (let [reply (get-in db [::comments reply-id])
+            parent (get-in db [::comments parent-comment-id])
+            original-author (:author-id parent)
+            reply-author (:author-id reply)
+            mentioned-users (->> (::comment-mentions db)
+                                 (filter (fn [[[comment-id _] _]] (= comment-id reply-id)))
+                                 (map (fn [[[ _ user-id] _]] user-id))
+                                 set)]
+        (when (and (some? original-author)
+                   (not= original-author reply-author)
+                   (not (contains? mentioned-users original-author)))
+          (-> db
+              (update :notifications/events disj cmd)
+              (update :notifications/outbox conj
+                      {:to original-author
+                       :type :reply
+                       :reply-id reply-id
+                       :original-comment-id parent-comment-id})))))))
+
+(r/defproc edit-comment
+  (fn [{:keys [:comments/events] :as db}]
+    (when-let [{:keys [actor-id comment-id new-body] :as cmd}
+               (take-event events :edit-comment)]
+      (let [comment (get-in db [::comments comment-id])]
+        (when (and (= actor-id (:author-id comment))
+                   (= :active (:status comment)))
+          (let [old-mentions (->> (::comment-mentions db)
+                                  keys
+                                  (filter (fn [[cid _]] (= cid comment-id)))
+                                  (map second)
+                                  set)
+                new-mentions (parse-mentions new-body)
+                removed-mentions (set/difference old-mentions new-mentions)
+                added-mentions (set/difference new-mentions old-mentions)
+                now (:clock/now db)]
+            (let [db' (-> db
+                          (update :comments/events disj cmd)
+                          (assoc-in [::comments comment-id :body] new-body)
+                          (assoc-in [::comments comment-id :edited-at] now)
+                          (update ::comment-mentions
+                                  (fn [mentions]
+                                    (reduce (fn [acc user-id]
+                                              (dissoc acc [comment-id user-id]))
+                                            mentions
+                                            removed-mentions))))]
+              (reduce (fn [acc user-id]
+                        (assoc-in acc [::comment-mentions [comment-id user-id]]
+                                  {:comment-id comment-id
+                                   :user-id user-id
+                                   :notified false}))
+                      db'
+                      added-mentions))))))))
+
+(r/defproc delete-comment
+  (fn [{:keys [:comments/events] :as db}]
+    (when-let [{:keys [actor-id comment-id] :as cmd}
+               (take-event events :delete-comment)]
+      (let [comment (get-in db [::comments comment-id])
+            actor-admin? (true? (get-in db [::users actor-id :is-admin]))]
+        (when (and (= :active (:status comment))
+                   (or (= actor-id (:author-id comment))
+                       actor-admin?))
+          (-> db
+              (update :comments/events disj cmd)
+              (assoc-in [::comments comment-id :status] :deleted)))))))
+
+(r/defproc add-reaction
+  (fn [{:keys [:comments/events] :as db}]
+    (when-let [{:keys [user-id comment-id emoji] :as cmd}
+               (take-event events :add-reaction)]
+      (when (and (= :active (get-in db [::comments comment-id :status]))
+                 (nil? (get-in db [::comment-reactions [comment-id user-id emoji]])))
+        (-> db
+            (update :comments/events disj cmd)
+            (assoc-in [::comment-reactions [comment-id user-id emoji]]
+                      {:comment-id comment-id
+                       :user-id user-id
+                       :emoji emoji
+                       :created-at (:clock/now db)}))))))
+
+(r/defproc remove-reaction
+  (fn [{:keys [:comments/events] :as db}]
+    (when-let [{:keys [user-id comment-id emoji] :as cmd}
+               (take-event events :remove-reaction)]
+      (when (and (= :active (get-in db [::comments comment-id :status]))
+                 (some? (get-in db [::comment-reactions [comment-id user-id emoji]])))
+        (-> db
+            (update :comments/events disj cmd)
+            (update ::comment-reactions dissoc [comment-id user-id emoji]))))))
+
+(r/defproc toggle-reaction
+  (fn [{:keys [:comments/events] :as db}]
+    (when-let [{:keys [user-id comment-id emoji] :as cmd}
+               (take-event events :toggle-reaction)]
+      (when (= :active (get-in db [::comments comment-id :status]))
+        (let [reaction-path [::comment-reactions [comment-id user-id emoji]]]
+          (-> db
+              (update :comments/events disj cmd)
+              ((fn [x]
+                 (if (some? (get-in x reaction-path))
+                   (update x ::comment-reactions dissoc [comment-id user-id emoji])
+                   (assoc-in x reaction-path
+                             {:comment-id comment-id
+                              :user-id user-id
+                              :emoji emoji
+                              :created-at (:clock/now x)}))))))))))
 ```
--- comments.allium
-
-------------------------------------------------------------
--- Entities
-------------------------------------------------------------
-
-external entity User {
-    name: String
-    is_admin: Boolean
-}
-
-external entity Commentable {
-    -- Defined by the consuming spec (e.g., Document, Task, Project)
-}
-
-entity Comment {
-    parent: Commentable
-    reply_to: Comment?              -- null for top-level, set for replies
-    author: User
-    body: String
-    created_at: Timestamp
-    edited_at: Timestamp?
-    status: active | deleted
-
-    -- Relationships
-    mentions: CommentMention with comment = this
-    replies: Comment with reply_to = this
-    reactions: CommentReaction with comment = this
-
-    -- Projections
-    active_replies: replies where status = active
-
-    -- Derived
-    is_reply: reply_to != null
-    is_edited: edited_at != null
-    mentioned_users: mentions -> user
-    thread_depth: if is_reply: reply_to.thread_depth + 1 else: 0
-}
-
--- Join entity for mentions
-entity CommentMention {
-    comment: Comment
-    user: User
-    notified: Boolean
-}
-
-entity CommentReaction {
-    comment: Comment
-    user: User
-    emoji: String                   -- e.g., "👍", "❤️", "🎉"
-    created_at: Timestamp
-}
-
-------------------------------------------------------------
--- Creating comments
-------------------------------------------------------------
-
-rule CreateComment {
-    when: CreateComment(author, parent, body)
-
-    let mentioned_usernames = parse_mentions(body)    -- black box: extracts @username
-    let mentioned_users = users_with_usernames(mentioned_usernames)    -- black box lookup
-
-    ensures:
-        let comment = Comment.created(
-            parent: parent,
-            reply_to: null,
-            author: author,
-            body: body,
-            created_at: now,
-            status: active
-        )
-        for user in mentioned_users:
-            CommentMention.created(
-                comment: comment,
-                user: user,
-                notified: false
-            )
-}
-
-rule CreateReply {
-    when: CreateReply(author, parent_comment, body)
-
-    let mentioned_usernames = parse_mentions(body)
-    let mentioned_users = users_with_usernames(mentioned_usernames)    -- black box lookup
-
-    requires: parent_comment.status = active
-    requires: parent_comment.thread_depth < 3    -- limit nesting
-
-    ensures:
-        let comment = Comment.created(
-            parent: parent_comment.parent,
-            reply_to: parent_comment,
-            author: author,
-            body: body,
-            created_at: now,
-            status: active
-        )
-        for user in mentioned_users:
-            CommentMention.created(
-                comment: comment,
-                user: user,
-                notified: false
-            )
-}
-
-------------------------------------------------------------
--- Notifications for mentions and replies
-------------------------------------------------------------
-
--- Trigger the notification system when someone is mentioned
-rule NotifyMentionedUser {
-    when: mention: CommentMention.created
-
-    requires: mention.user != mention.comment.author    -- don't notify self
-    requires: not mention.notified
-
-    ensures: mention.notified = true
-    ensures: UserMentioned(
-        user: mention.user,
-        comment: mention.comment,
-        mentioned_by: mention.comment.author
-    )
-}
-
--- Trigger the notification system when someone's comment receives a reply
-rule NotifyCommentAuthorOfReply {
-    when: comment: Comment.created
-
-    let original_author = comment.reply_to?.author
-
-    requires: comment.is_reply
-    requires: original_author != null
-    requires: original_author != comment.author    -- don't notify self
-    requires: original_author not in comment.mentioned_users    -- avoid double notify
-
-    ensures: CommentReplied(
-        original_author: original_author,
-        reply: comment,
-        original_comment: comment.reply_to
-    )
-}
-
-------------------------------------------------------------
--- Editing
-------------------------------------------------------------
-
-rule EditComment {
-    when: EditComment(actor, comment, new_body)
-
-    requires: actor = comment.author
-    requires: comment.status = active
-
-    let old_mentions = comment.mentioned_users
-    let new_mentioned_usernames = parse_mentions(new_body)
-    let new_mentioned_users = users_with_usernames(new_mentioned_usernames)    -- black box lookup
-    let added_mentions = new_mentioned_users - old_mentions
-    let removed_mentions = old_mentions - new_mentioned_users
-
-    ensures: comment.body = new_body
-    ensures: comment.edited_at = now
-
-    -- Remove old mentions that are no longer present
-    ensures: for user in removed_mentions:
-        not exists CommentMention{comment, user}
-
-    -- Add new mentions
-    ensures: for user in added_mentions:
-        CommentMention.created(
-            comment: comment,
-            user: user,
-            notified: false
-        )
-}
-
-------------------------------------------------------------
--- Deleting
-------------------------------------------------------------
-
-rule DeleteComment {
-    when: DeleteComment(actor, comment)
-
-    requires: actor = comment.author or actor.is_admin
-    requires: comment.status = active
-
-    ensures: comment.status = deleted
-    -- Note: replies remain but show "deleted comment"
-}
-
-------------------------------------------------------------
--- Reactions
-------------------------------------------------------------
-
-rule AddReaction {
-    when: AddReaction(user, comment, emoji)
-
-    requires: comment.status = active
-    requires: not exists CommentReaction{comment, user, emoji}
-
-    ensures: CommentReaction.created(
-        comment: comment,
-        user: user,
-        emoji: emoji,
-        created_at: now
-    )
-}
-
-rule RemoveReaction {
-    when: RemoveReaction(user, comment, emoji)
-
-    let reaction = CommentReaction{comment, user, emoji}
-
-    requires: comment.status = active
-    requires: exists reaction
-
-    ensures: not exists reaction
-}
-
-rule ToggleReaction {
-    when: ToggleReaction(user, comment, emoji)
-
-    let existing = CommentReaction{comment, user, emoji}
-
-    requires: comment.status = active
-
-    ensures:
-        if exists existing:
-            not exists existing
-        else:
-            CommentReaction.created(
-                comment: comment,
-                user: user,
-                emoji: emoji,
-                created_at: now
-            )
-}
-
-------------------------------------------------------------
--- Surfaces
-------------------------------------------------------------
-
-surface CommentThread {
-    facing viewer: User
-
-    context parent: Commentable
-
-    let comments = Comments where parent = parent and status = active
-
-    exposes:
-        for comment in comments:
-            comment.author.name
-            comment.body
-            comment.created_at
-            comment.is_edited
-            comment.active_replies
-            comment.reactions
-
-    provides:
-        CreateComment(viewer, parent, body)
-        for comment in comments:
-            CreateReply(viewer, comment, body)
-                when comment.thread_depth < 3
-            EditComment(viewer, comment, new_body)
-                when viewer = comment.author
-            DeleteComment(viewer, comment)
-                when viewer = comment.author or viewer.is_admin
-            AddReaction(viewer, comment, emoji)
-            RemoveReaction(viewer, comment, emoji)
-                when exists CommentReaction{comment: comment, user: viewer, emoji: emoji}
-
-    guidance:
-        -- Show "edited" indicator when comment.is_edited.
-        -- Show "deleted comment" placeholder for deleted replies
-        -- rather than removing them from the thread.
-}
-```
-
-**Key language features shown:**
-- Nested/recursive entities (comments with replies)
-- Entity creation triggers with binding (`when: mention: CommentMention.created`)
-- Black box functions (`parse_mentions()`, `users_with_usernames()`)
-- Explicit `let` binding for created entities
-- Set operations (`new_mentioned_users - old_mentions`)
-- Depth limiting (`thread_depth < 3`)
-- **Cross-pattern triggers**: Emits `UserMentioned` and `CommentReplied` triggers that Pattern 5 handles
-- Avoiding double notifications (`original_author not in comment.mentioned_users`)
-- Toggle pattern with conditional ensures
-- Join entity with three keys (`CommentReaction{comment, user, emoji}`)
-- Surface with role-conditional actions (author can edit, author or admin can delete)
-
----
 
 ## Pattern 8: Integrating Library Specs
 
-**Demonstrates:** External spec references with coordinates, configuration blocks, responding to external triggers, using external entities
-
-Library specs are standalone specifications for common functionality - authentication providers, payment processors, email services, etc. They define a contract that implementations must satisfy, and your application spec composes them in.
+In Recife, this means composing reusable library model namespaces with application model namespaces.
 
 ### Example: OAuth Authentication
 
-This example shows integrating a library OAuth spec into your application. The OAuth spec handles the authentication flow; your application responds to authentication events and manages application-level user state.
+Files:
 
-```
--- app-auth.allium
+- `oauth2/model.clj` (library model)
+- `app-auth/model.clj` (application model)
 
-------------------------------------------------------------
--- External Spec References
-------------------------------------------------------------
+```clojure
+(ns app-auth.model
+  (:require [oauth2.model :as oauth]
+            [recife.core :as r]))
 
--- Reference the OAuth spec from the library
--- The coordinate is immutable (git SHA), ensuring reproducible specs
-use "github.com/allium-specs/oauth2/af8e2c1d" as oauth
+(def global
+  (merge oauth/global
+         {::users {}
+          ::user-preferences {}
+          :app/events #{}
+          :app/notifications []
+          :audit/outbox []
+          :mail/outbox []
+          :clock/now 0}))
 
--- Configure the OAuth spec for our application
-oauth/config {
-    providers: { google, microsoft, github }
-    session_duration: 24.hours
-    refresh_window: 1.hour
-    link_expiry: 15.minutes
-}
+(defn take-event [events event-type]
+  (first (filter #(= event-type (:type %)) events)))
 
-------------------------------------------------------------
--- Application Entities
-------------------------------------------------------------
+(defn user-by-email [db email]
+  (first (filter (fn [[_ user]] (= email (:email user))) (::users db))))
 
--- Our application's User entity, linked to OAuth identities
-entity User {
-    email: String
-    name: String
-    avatar_url: String?
-    status: active | suspended | deactivated
-    created_at: Timestamp
-    last_login_at: Timestamp?
+(r/defproc create-user-on-first-login
+  (fn [{:keys [:oauth/events] :as db}]
+    (when-let [event (take-event events :authentication-succeeded)]
+      (when-not (user-by-email db (:email event))
+        (let [user-id (keyword (str "user-" (inc (count (::users db)))))
+              now (:clock/now db)]
+          (-> db
+              (update :oauth/events disj event)
+              (assoc-in [::users user-id]
+                        {:email (:email event)
+                         :name (:display-name event)
+                         :avatar-url (:avatar-url event)
+                         :status :active
+                         :created-at now
+                         :last-login-at now})
+              (assoc-in [::user-preferences user-id]
+                        {:theme :system
+                         :timezone (or (:timezone event) "UTC")
+                         :locale (or (:locale event) "en")})
+              (assoc-in [:oauth/identities (:identity-id event) :user-id] user-id)
+              (assoc-in [:oauth/sessions (:session-id event) :user-id] user-id)
+              (update :mail/outbox conj
+                      {:to (:email event)
+                       :template :welcome
+                       :data {:provider (:provider event)}})))))))
 
-    -- Relationship to OAuth sessions (from external spec)
-    sessions: oauth/Session with user = this
-    identities: oauth/Identity with user = this
+(r/defproc update-user-on-login
+  (fn [{:keys [:oauth/events] :as db}]
+    (when-let [event (take-event events :authentication-succeeded)]
+      (when-let [[user-id user] (user-by-email db (:email event))]
+        (when (= :active (:status user))
+          (-> db
+              (update :oauth/events disj event)
+              (assoc-in [::users user-id :last-login-at] (:clock/now db))
+              (assoc-in [:oauth/sessions (:session-id event) :user-id] user-id)))))))
 
-    -- Projections
-    active_sessions: sessions where status = active
+(r/defproc block-suspended-user-login
+  (fn [{:keys [:oauth/events] :as db}]
+    (when-let [event (take-event events :authentication-succeeded)]
+      (when-let [[user-id user] (user-by-email db (:email event))]
+        (when (= :suspended (:status user))
+          (-> db
+              (update :oauth/events disj event)
+              (assoc-in [:oauth/sessions (:session-id event) :status] :revoked)
+              (update :app/notifications conj
+                      {:type :user-informed
+                       :user-id user-id
+                       :about :account-suspended
+                       :data {:contact "support@example.com"}})))))))
 
-    -- Derived
-    is_authenticated: active_sessions.count > 0
-    linked_providers: identities -> provider
-}
+(r/defproc notify-session-expiring
+  (fn [{:keys [:oauth/events] :as db}]
+    (when-let [event (take-event events :session-status-changed)]
+      (when (= :expiring (:status event))
+        (when-let [user-id (get-in db [:oauth/sessions (:session-id event) :user-id])]
+          (-> db
+              (update :oauth/events disj event)
+              (update :app/notifications conj
+                      {:type :user-informed
+                       :user-id user-id
+                       :about :session-expiring
+                       :data {:time-remaining (:time-remaining event)}})))))))
 
--- Application-specific user preferences
-entity UserPreferences {
-    user: User
-    theme: light | dark | system
-    timezone: String
-    locale: String
-}
+(r/defproc audit-logout
+  (fn [{:keys [:oauth/events] :as db}]
+    (when-let [event (take-event events :session-terminated)]
+      (when-let [user-id (get-in db [:oauth/sessions (:session-id event) :user-id])]
+        (-> db
+            (update :oauth/events disj event)
+            (update :audit/outbox conj
+                    {:user-id user-id
+                     :event :logout
+                     :reason (:reason event)
+                     :timestamp (:clock/now db)
+                     :metadata {:provider (:provider event)
+                                :session-start (:created-at event)}}))))))
 
-------------------------------------------------------------
--- Responding to OAuth Events
-------------------------------------------------------------
+(r/defproc link-additional-provider
+  (fn [{:keys [:app/events] :as db}]
+    (when-let [{:keys [user-id provider] :as cmd}
+               (take-event events :link-provider)]
+      (let [user (get-in db [::users user-id])
+            linked-providers (->> (:oauth/identities db)
+                                  vals
+                                  (filter #(= user-id (:user-id %)))
+                                  (map :provider)
+                                  set)]
+        (when (and (= :active (:status user))
+                   (not (contains? linked-providers provider)))
+          (-> db
+              (update :app/events disj cmd)
+              (update :oauth/events conj
+                      {:type :initiate-authentication
+                       :provider provider
+                       :intent :link-account
+                       :existing-user-id user-id})))))))
 
--- When a user authenticates for the first time, create our User entity
-rule CreateUserOnFirstLogin {
-    when: oauth/AuthenticationSucceeded(identity, session)
-
-    requires: not exists User{email: identity.email}
-
-    ensures:
-        let user = User.created(
-            email: identity.email,
-            name: identity.display_name,
-            avatar_url: identity.avatar_url,
-            status: active,
-            created_at: now,
-            last_login_at: now
-        )
-        -- Link the OAuth identity to our user
-        identity.user = user
-        session.user = user
-        -- Create default preferences
-        UserPreferences.created(
-            user: user,
-            theme: system,
-            timezone: identity.timezone ?? "UTC",
-            locale: identity.locale ?? "en"
-        )
-        Email.created(
-            to: user.email,
-            template: welcome,
-            data: { user: user, provider: identity.provider }
-        )
-}
-
--- When an existing user logs in, update last login
-rule UpdateUserOnLogin {
-    when: oauth/AuthenticationSucceeded(identity, session)
-
-    let user = User{email: identity.email}
-
-    requires: exists user
-    requires: user.status = active
-
-    ensures: user.last_login_at = now
-    ensures: session.user = user
-}
-
--- Block login for suspended users
-rule BlockSuspendedUserLogin {
-    when: oauth/AuthenticationSucceeded(identity, session)
-
-    let user = User{email: identity.email}
-
-    requires: exists user
-    requires: user.status = suspended
-
-    ensures: session.status = revoked
-    ensures: UserInformed(
-        user: user,
-        about: account_suspended,
-        data: { contact: "support@example.com" }
-    )
-}
-
--- When OAuth session expires, we might want to notify
-rule NotifySessionExpiring {
-    when: session: oauth/Session.status transitions_to expiring
-
-    let user = session.user
-
-    requires: user != null
-
-    ensures: UserInformed(
-        user: user,
-        about: session_expiring,
-        data: { time_remaining: session.time_remaining }
-    )
-}
-
--- Audit logging for security events
-rule AuditLogout {
-    when: oauth/SessionTerminated(session, reason)
-
-    let user = session.user
-
-    requires: user != null
-
-    ensures: AuditLog.created(
-        user: user,
-        event: logout,
-        reason: reason,
-        timestamp: now,
-        metadata: { provider: session.provider, session_start: session.created_at }
-    )
-}
-
-------------------------------------------------------------
--- Application Actions Using OAuth
-------------------------------------------------------------
-
-rule LinkAdditionalProvider {
-    when: LinkProvider(user, provider)
-
-    requires: user.status = active
-    requires: provider not in user.linked_providers
-
-    -- Trigger the OAuth flow from the library spec
-    ensures: oauth/InitiateAuthentication(
-        provider: provider,
-        intent: link_account,
-        existing_user: user
-    )
-}
-
-rule UnlinkProvider {
-    when: UnlinkProvider(user, provider)
-
-    let identity = oauth/Identity{user, provider}
-
-    requires: user.status = active
-    requires: exists identity
-    requires: user.linked_providers.count > 1    -- must keep at least one
-
-    ensures: not exists identity
-    ensures: AuditLog.created(
-        user: user,
-        event: provider_unlinked,
-        timestamp: now,
-        metadata: { provider: provider }
-    )
-}
+(r/defproc unlink-provider
+  (fn [{:keys [:app/events] :as db}]
+    (when-let [{:keys [user-id provider] :as cmd}
+               (take-event events :unlink-provider)]
+      (let [identities (filter (fn [[_ identity]]
+                                 (= user-id (:user-id identity)))
+                               (:oauth/identities db))
+            identity-id (first (keep (fn [[identity-id identity]]
+                                       (when (and (= user-id (:user-id identity))
+                                                  (= provider (:provider identity)))
+                                         identity-id))
+                                     (:oauth/identities db)))]
+        (when (and (some? identity-id)
+                   (> (count identities) 1)
+                   (= :active (get-in db [::users user-id :status])))
+          (-> db
+              (update :app/events disj cmd)
+              (update :oauth/identities dissoc identity-id)
+              (update :audit/outbox conj
+                      {:user-id user-id
+                       :event :provider-unlinked
+                       :timestamp (:clock/now db)
+                       :metadata {:provider provider}})))))))
 ```
 
 ### Example: Payment Processing
 
-This example shows integrating a payment processor spec for subscription billing.
+Files:
 
+- `stripe-billing/model.clj` (library model)
+- `billing/model.clj` (application model)
+
+```clojure
+(ns billing.model
+  (:require [recife.core :as r]
+            [stripe-billing.model :as stripe]))
+
+(def global
+  (merge stripe/global
+         {::organisations {}
+          ::subscriptions {}
+          ::documents {}
+          :billing/events #{}
+          :mail/outbox []
+          :audit/outbox []
+          :app/notifications []
+          :clock/now 0}))
+
+(defn take-event [events event-type]
+  (first (filter #(= event-type (:type %)) events)))
+
+(defn org-id-by-customer [db customer-id]
+  (first (keep (fn [[org-id org]]
+                 (when (= customer-id (:stripe-customer-id org))
+                   org-id))
+               (::organisations db))))
+
+(defn org-sub-id [db org-id]
+  (first (keep (fn [[sub-id sub]]
+                 (when (= org-id (:organisation-id sub))
+                   sub-id))
+               (::subscriptions db))))
+
+(r/defproc activate-on-payment-success
+  (fn [{:keys [:stripe/events] :as db}]
+    (when-let [event (take-event events :payment-succeeded)]
+      (let [org-id (org-id-by-customer db (:customer-id event))
+            sub-id (some-> org-id (org-sub-id db))]
+        (when (and org-id sub-id
+                   (contains? #{:trialing :past-due}
+                              (get-in db [::subscriptions sub-id :status])))
+          (-> db
+              (update :stripe/events disj event)
+              (assoc-in [::subscriptions sub-id :status] :active)
+              (assoc-in [::subscriptions sub-id :current-period-ends-at]
+                        (:period-end event))
+              (update :mail/outbox conj
+                      {:to (get-in db [::organisations org-id :owner-email])
+                       :template :payment-confirmed
+                       :data {:amount (:amount event)
+                              :next-billing (:period-end event)}})))))))
+
+(r/defproc handle-payment-failure
+  (fn [{:keys [:stripe/events] :as db}]
+    (when-let [event (take-event events :payment-failed)]
+      (let [org-id (org-id-by-customer db (:customer-id event))
+            sub-id (some-> org-id (org-sub-id db))]
+        (when (and org-id sub-id)
+          (-> db
+              (update :stripe/events disj event)
+              (assoc-in [::subscriptions sub-id :status] :past-due)
+              (update :mail/outbox conj
+                      {:to (get-in db [::organisations org-id :owner-email])
+                       :template :payment-failed
+                       :data {:reason (:failure-reason event)
+                              :retry-date (:next-payment-attempt event)
+                              :update-payment-url (get-in db [::organisations org-id :billing-portal-url])}})
+              (update :app/notifications conj
+                      {:type :user-informed
+                       :user-id (get-in db [::organisations org-id :owner-id])
+                       :about :payment-failed
+                       :data {:reason (:failure-reason event)}})))))))
+
+(r/defproc trial-ending-reminder
+  (fn [{:keys [::subscriptions :clock/now] :as db}]
+    (reduce-kv
+     (fn [acc sub-id sub]
+       (if (and (= :trialing (:status sub))
+                (not (:trial-reminder-sent sub))
+                (some? (:trial-ends-at sub))
+                (<= (- (:trial-ends-at sub) (* 3 24 60 60 1000)) now))
+         (let [org-id (:organisation-id sub)]
+           (-> acc
+               (assoc-in [::subscriptions sub-id :trial-reminder-sent] true)
+               (update :mail/outbox conj
+                       {:to (get-in acc [::organisations org-id :owner-email])
+                        :template :trial-ending
+                        :data {:days-remaining 3
+                               :plan (:plan-id sub)
+                               :has-payment-method
+                               (true? (get-in acc [::organisations org-id :has-payment-method]))}})))
+         acc))
+     db
+     subscriptions)))
+
+(r/defproc handle-subscription-cancelled
+  (fn [{:keys [:stripe/events] :as db}]
+    (when-let [event (take-event events :subscription-cancelled)]
+      (let [sub-id (first (keep (fn [[sub-id sub]]
+                                  (when (= (:stripe-subscription-id sub)
+                                           (:stripe-subscription-id event))
+                                    sub-id))
+                                (::subscriptions db)))
+            org-id (get-in db [::subscriptions sub-id :organisation-id])]
+        (when (and sub-id org-id)
+          (-> db
+              (update :stripe/events disj event)
+              (assoc-in [::subscriptions sub-id :status] :cancelled)
+              (update :mail/outbox conj
+                      {:to (get-in db [::organisations org-id :owner-email])
+                       :template :subscription-cancelled
+                       :data {:reason (:reason event)
+                              :access-until (get-in db [::subscriptions sub-id :current-period-ends-at])}})
+              (update :audit/outbox conj
+                      {:user-id (get-in db [::organisations org-id :owner-id])
+                       :event :subscription-cancelled
+                       :timestamp (:clock/now db)
+                       :metadata {:reason (:reason event)
+                                  :plan (get-in db [::subscriptions sub-id :plan-id])}})))))))
+
+(r/defproc start-subscription
+  (fn [{:keys [:billing/events] :as db}]
+    (when-let [{:keys [org-id plan-id] :as cmd}
+               (take-event events :start-subscription)]
+      (let [sub-id (org-sub-id db org-id)
+            org (get-in db [::organisations org-id])
+            sub (and sub-id (get-in db [::subscriptions sub-id]))]
+        (when (and (or (nil? sub)
+                       (contains? #{:cancelled :expired} (:status sub)))
+                   (some? (:stripe-customer-id org))
+                   (true? (:has-payment-method org)))
+          (-> db
+              (update :billing/events disj cmd)
+              (update :stripe/events conj
+                      {:type :create-subscription
+                       :customer-id (:stripe-customer-id org)
+                       :price-id (:stripe-price-id plan-id)
+                       :trial-period-days (if (:has-trial plan-id) 14 nil)})))))))
+
+(r/defproc change-plan
+  (fn [{:keys [:billing/events] :as db}]
+    (when-let [{:keys [org-id new-plan-id] :as cmd}
+               (take-event events :change-plan)]
+      (let [sub-id (org-sub-id db org-id)
+            sub (and sub-id (get-in db [::subscriptions sub-id]))]
+        (when (and sub-id
+                   (= :active (:status sub))
+                   (not= new-plan-id (:plan-id sub)))
+          (-> db
+              (update :billing/events disj cmd)
+              (update :stripe/events conj
+                      {:type :update-subscription
+                       :subscription-id (:stripe-subscription-id sub)
+                       :new-price-id (:stripe-price-id new-plan-id)})
+              (assoc-in [::subscriptions sub-id :plan-id] new-plan-id)))))))
+
+(r/defproc cancel-subscription
+  (fn [{:keys [:billing/events] :as db}]
+    (when-let [{:keys [org-id reason] :as cmd}
+               (take-event events :cancel-subscription)]
+      (let [sub-id (org-sub-id db org-id)
+            sub (and sub-id (get-in db [::subscriptions sub-id]))]
+        (when (and sub-id
+                   (contains? #{:active :trialing} (:status sub)))
+          (-> db
+              (update :billing/events disj cmd)
+              (update :stripe/events conj
+                      {:type :cancel-subscription
+                       :subscription-id (:stripe-subscription-id sub)
+                       :at-period-end true})
+              (update :audit/outbox conj
+                      {:user-id (get-in db [::organisations org-id :owner-id])
+                       :event :cancellation-requested
+                       :timestamp (:clock/now db)
+                       :metadata {:reason reason}})))))))
+
+(r/defproc edit-document
+  (fn [{:keys [:billing/events] :as db}]
+    (when-let [{:keys [actor-id document-id new-content] :as cmd}
+               (take-event events :edit-document)]
+      (when (true? (get-in db [:rbac/permissions [actor-id document-id] :can-edit]))
+        (-> db
+            (update :billing/events disj cmd)
+            (assoc-in [::documents document-id :content] new-content)))))))
 ```
--- billing.allium
-
-------------------------------------------------------------
--- External Spec References
-------------------------------------------------------------
-
-use "github.com/allium-specs/stripe-billing/b2c4e6f8" as stripe
-
-stripe/config {
-    currency: USD
-    tax_calculation: automatic
-    proration: create_prorations
-    trial_period: 14.days
-}
-
-------------------------------------------------------------
--- Application Entities
-------------------------------------------------------------
-
-entity Organisation {
-    name: String
-    owner: User
-    billing_portal_url: String?
-
-    -- Link to Stripe customer (from external spec)
-    stripe_customer: stripe/Customer?
-
-    -- Relationships
-    subscription: Subscription with organisation = this
-    invoices: stripe/Invoice with stripe_customer = this
-
-    -- Derived
-    is_paying: subscription?.status = active
-    has_payment_method: stripe_customer?.default_payment_method != null
-}
-
-entity Subscription {
-    organisation: Organisation
-    plan: Plan
-    status: trialing | active | past_due | cancelled | expired
-    started_at: Timestamp
-    trial_ends_at: Timestamp?
-    current_period_ends_at: Timestamp
-    trial_reminder_sent: Boolean
-
-    -- Link to Stripe subscription
-    stripe_subscription: stripe/Subscription?
-
-    -- Derived
-    is_trial: status = trialing
-    days_until_renewal: current_period_ends_at - now
-}
-
-------------------------------------------------------------
--- Responding to Payment Events
-------------------------------------------------------------
-
--- When Stripe confirms payment, activate or renew subscription
-rule ActivateOnPaymentSuccess {
-    when: stripe/PaymentSucceeded(invoice)
-
-    let customer = invoice.customer
-    let org = Organisation{stripe_customer: customer}
-    let sub = org.subscription
-
-    requires: exists org
-    requires: sub.status in {trialing, past_due}
-
-    ensures: sub.status = active
-    ensures: sub.current_period_ends_at = invoice.period_end
-    ensures: Email.created(
-        to: org.owner.email,
-        template: payment_confirmed,
-        data: { amount: invoice.amount, next_billing: invoice.period_end }
-    )
-}
-
--- Handle failed payments
-rule HandlePaymentFailure {
-    when: stripe/PaymentFailed(invoice, failure_reason)
-
-    let customer = invoice.customer
-    let org = Organisation{stripe_customer: customer}
-    let sub = org.subscription
-
-    requires: exists org
-
-    ensures: sub.status = past_due
-    ensures: Email.created(
-        to: org.owner.email,
-        template: payment_failed,
-        data: {
-            reason: failure_reason,
-            retry_date: invoice.next_payment_attempt,
-            update_payment_url: org.billing_portal_url
-        }
-    )
-    ensures: UserInformed(
-        user: org.owner,
-        about: payment_failed,
-        data: { reason: failure_reason }
-    )
-}
-
--- When trial is ending, remind user
-rule TrialEndingReminder {
-    when: sub: Subscription.trial_ends_at - 3.days <= now
-
-    requires: sub.status = trialing
-    requires: not sub.trial_reminder_sent
-
-    let org = sub.organisation
-
-    ensures: sub.trial_reminder_sent = true
-    ensures: Email.created(
-        to: org.owner.email,
-        template: trial_ending,
-        data: {
-            days_remaining: 3,
-            plan: sub.plan,
-            has_payment_method: org.has_payment_method
-        }
-    )
-}
-
--- Respond to subscription cancellation from Stripe
-rule HandleSubscriptionCancelled {
-    when: stripe/SubscriptionCancelled(stripe_sub, reason)
-
-    let sub = Subscription{stripe_subscription: stripe_sub}
-    let org = sub.organisation
-
-    requires: exists sub
-
-    ensures: sub.status = cancelled
-    ensures: Email.created(
-        to: org.owner.email,
-        template: subscription_cancelled,
-        data: { reason: reason, access_until: sub.current_period_ends_at }
-    )
-    ensures: AuditLog.created(
-        user: org.owner,
-        event: subscription_cancelled,
-        timestamp: now,
-        metadata: { reason: reason, plan: sub.plan.name }
-    )
-}
-
-------------------------------------------------------------
--- Application Actions Using Stripe
-------------------------------------------------------------
-
-rule StartSubscription {
-    when: StartSubscription(org, plan)
-
-    requires: org.subscription = null or org.subscription.status in {cancelled, expired}
-    requires: org.stripe_customer != null
-    requires: org.has_payment_method
-
-    ensures: stripe/CreateSubscription(
-        customer: org.stripe_customer,
-        price: plan.stripe_price_id,
-        trial_period: if plan.has_trial: stripe/config.trial_period else: null
-    )
-}
-
-rule ChangePlan {
-    when: ChangePlan(org, new_plan)
-
-    let sub = org.subscription
-
-    requires: sub.status = active
-    requires: new_plan != sub.plan
-
-    ensures: stripe/UpdateSubscription(
-        subscription: sub.stripe_subscription,
-        new_price: new_plan.stripe_price_id
-    )
-    ensures: sub.plan = new_plan
-}
-
-rule CancelSubscription {
-    when: CancelSubscription(org, reason)
-
-    let sub = org.subscription
-
-    requires: sub.status in {active, trialing}
-
-    ensures: stripe/CancelSubscription(
-        subscription: sub.stripe_subscription,
-        at_period_end: true    -- access continues until paid period ends
-    )
-    ensures: AuditLog.created(
-        user: org.owner,
-        event: cancellation_requested,
-        timestamp: now,
-        metadata: { reason: reason }
-    )
-}
-```
-
-**Key language features shown:**
-- External spec references with immutable coordinates (`use "github.com/.../abc123" as alias`)
-- Configuration blocks for external specs (`oauth/config { ... }`)
-- Responding to external triggers (`when: oauth/AuthenticationSucceeded(...)`)
-- Trigger emissions for cross-pattern notification (`UserInformed(...)`)
-- Responding to external state transitions (`when: session: oauth/Session.status transitions_to expiring`)
-- Using external entities (`oauth/Session`, `stripe/Customer`)
-- Linking application entities to external entities (`stripe_customer: stripe/Customer?`)
-- Triggering external actions (`ensures: stripe/CreateSubscription(...)`)
-- Qualified names throughout (`oauth/Session`, `stripe/config.trial_period`)
 
 ### Library Spec Design Principles
 
-When creating or choosing library specs:
+For Recife library models:
 
-1. **Immutable coordinates**: Always use content-addressed references (git SHAs), never floating versions
-2. **Configuration over convention**: Library specs should expose configuration for anything that might vary between applications
-3. **Observable triggers**: Library specs should emit triggers for all significant events so consuming specs can respond
-4. **Minimal coupling**: Library specs shouldn't depend on your application entities - the linkage goes one way
-5. **Clear boundaries**: The library spec handles its domain (OAuth flow, payment processing); your spec handles application concerns (user creation, access control)
-
----
+1. Use immutable source coordinates for library model imports.
+2. Expose configuration maps for provider-specific behavior.
+3. Emit normalized events for all important domain transitions.
+4. Keep coupling one-way: app models depend on library models, not vice versa.
+5. Keep library boundaries narrow and domain-focused.
 
 ## Using These Patterns
 
 ### Composition
 
-Patterns can be composed. For example, a complete document collaboration spec might use:
+Combine pattern components in one run:
 
+```clojure
+(comment
+  @(r/run-model
+    global
+    #{password-auth/register
+      password-auth/login-success
+      password-auth/login-failure
+      password-auth/request-password-reset
+      rbac/create-workspace
+      rbac/add-member
+      rbac/create-document
+      resource-invitation/invite-to-resource
+      soft-delete/delete-document
+      soft-delete/restore-document
+      notifications/create-mention-notification
+      notifications/send-immediate-email
+      usage-limits/create-document
+      usage-limits/record-api-request
+      comments/create-comment
+      comments/notify-mentioned-user
+      app-auth/create-user-on-first-login
+      billing/activate-on-payment-success}))
 ```
-use "./rbac.allium" as rbac
-use "./soft-delete.allium" as trash
-use "./comments.allium" as comments
-use "./notifications.allium" as notify
 
-entity Document {
-    workspace: Workspace
-    title: String
-    content: String
-    status: active | deleted
-    deleted_at: Timestamp?
-    deleted_by: User?
-
-    -- From comments pattern
-    comments: comments/Comment with document = this
-
-    -- From soft-delete pattern
-    retention_expires_at: deleted_at + trash/config.retention_period
-    can_restore: status = deleted and retention_expires_at > now
-    ...
-}
-
--- Document actions require RBAC checks
-rule EditDocument {
-    when: EditDocument(user, document, content)
-
-    let share = rbac/ResourceShare{resource: document, user: user}
-
-    requires: share.can_edit
-    ...
-}
-```
+Keep pattern state keys namespaced to avoid collisions.
 
 ### Adaptation
 
-Patterns are starting points. When applying:
+Adapt by changing:
 
-1. **Rename** to match your domain (User → Member, Document → Note)
-2. **Adjust** timeouts and limits to your context
-3. **Remove** unused states or rules
-4. **Extend** with domain-specific behaviour
-5. **Compose** multiple patterns for richer functionality
+1. State keys and event shapes to your domain language.
+2. Config defaults (`::config` maps).
+3. Guards and transitions to policy details.
+4. Notification templates and external event contracts.
+5. Invariants/properties to your explicit guarantees.
 
 ### Anti-Patterns
 
-When using patterns, avoid:
+Avoid:
 
-- **Over-engineering**: Don't include reaction system if you don't need reactions
-- **Premature abstraction**: Start concrete, extract patterns when you see repetition
-- **Pattern worship**: If the pattern doesn't fit, adapt it or write something custom
-- **Ignoring context**: A free tier pattern that makes sense for B2C may not fit B2B
+- copying provider wire formats into app-level state keys
+- mixing command/event shape conventions for one concern
+- adding unbounded collections without safety checks
+- using implicit status transitions not represented in process code
+- keeping pattern names when your domain uses different terms

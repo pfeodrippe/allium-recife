@@ -1,236 +1,277 @@
 ---
-name: allium
-description: An LLM-native language for sharpening intent alongside implementation. Velocity through clarity.
+name: recife
+description: Clojure model checking for sharpening intent alongside implementation. Velocity through executable models.
 version: 1
 auto_trigger:
-  - file_patterns: ["**/*.allium"]
-  - keywords: ["allium", "allium spec", "allium specification", ".allium file"]
+  - file_patterns: ["**/*.clj"]
+  - keywords: ["recife", "recife model", "model checker", ".clj model"]
 ---
 
-# Allium
+# Recife
 
-Allium is a formal language for capturing software behaviour at the domain level. It sits between informal feature descriptions and implementation, providing a precise way to specify what software does without prescribing how it's built.
+Recife is a Clojure model checking library for capturing and validating system behaviour at the domain level. It sits between informal feature descriptions and implementation, providing executable models with invariants and temporal properties.
 
-The name comes from the botanical family containing onions and shallots, continuing a tradition in behaviour specification tooling established by Cucumber and Gherkin.
+The name comes from Recife, a city in Brazil, and reflects the project's Clojure-first approach to practical model checking.
 
 Key principles:
 
-- Describes observable behaviour, not implementation
-- Captures domain logic that matters at the behavioural level
-- Generates integration and end-to-end tests (not unit tests)
+- Describes observable behaviour, not infrastructure details
+- Captures domain logic as executable Clojure model processes
+- Checks safety (invariants) and liveness (temporal properties)
 - Forces ambiguities into the open before implementation
-- Implementation-agnostic: the same spec could be implemented in any language
+- Implementation-agnostic: the same model can validate many implementations
 
-Allium does NOT specify programming language or framework choices, database schemas or storage mechanisms, API designs or UI layouts, or internal algorithms (unless they are domain-level concerns).
+Recife does NOT prescribe framework choices, database schemas, API shapes or UI layouts, unless those are domain-level constraints that should be modelled explicitly.
 
 ## Routing table
 
 | Task | Skill | When |
 |------|-------|------|
-| Writing or reading `.allium` files | this skill | You need language syntax and structure |
-| Building a spec through conversation | `elicit` | User describes a feature or behaviour they want to build |
-| Extracting a spec from existing code | `distill` | User has implementation code and wants a spec from it |
+| Writing or reading Recife `.clj` model files | this skill | You need Recife syntax and structure |
+| Building a model through conversation | `elicit` | User describes behaviour they want to model |
+| Extracting a model from existing code | `distill` | User has implementation code and wants a Recife model |
 
 ## Quick syntax summary
 
 ### Entity
 
-```
-entity Candidacy {
-    -- Fields
-    candidate: Candidate
-    role: Role
-    status: pending | active | completed | cancelled   -- inline enum
-    retry_count: Integer
+In Recife, domain entities are usually modelled as maps in global state.
 
-    -- Relationships
-    invitation: Invitation with candidacy = this         -- one-to-one
-    slots: InterviewSlot with candidacy = this           -- one-to-many
+```clojure
+(def global
+  {::candidacies
+   {:cand-1 {:candidate-id :candidate-1
+          :role-id :role-1
+          :status :pending
+          :retry-count 0
+          :invitation-id :inv-1
+          :slot-ids #{:slot-1 :slot-2 :slot-3}}}
+   ::invitations
+   {:inv-1 {:candidacy-id :cand-1
+            :expires-at 1739786400000}}
+   ::interview-slots
+   {:slot-1 {:candidacy-id :cand-1 :status :confirmed}
+    :slot-2 {:candidacy-id :cand-1 :status :pending}
+    :slot-3 {:candidacy-id :cand-1 :status :confirmed}}})
 
-    -- Projections
-    confirmed_slots: slots where status = confirmed
-    pending_slots: slots where status = pending
+(defn confirmed-slots [db candidacy-id]
+  (->> (get-in db [::candidacies candidacy-id :slot-ids])
+       (filter #(= :confirmed (get-in db [::interview-slots % :status])))
+       set))
 
-    -- Derived
-    is_ready: confirmed_slots.count >= 3
-    has_expired: invitation.expires_at <= now
-}
+(defn candidacy-ready? [db candidacy-id]
+  (>= (count (confirmed-slots db candidacy-id)) 3))
 ```
 
 ### External entity
 
-```
-external entity Role { title: String, required_skills: Set<Skill>, location: Location }
+External systems are represented as namespaced keys and process boundaries.
+
+```clojure
+(def global
+  {::roles {:role-1 {:title "Senior Engineer"
+                     :required-skills #{:clojure :distributed-systems}
+                     :location {:name "Remote" :timezone "UTC"}}}
+   :oauth/requests #{}
+   :oauth/responses #{}
+   :calendar/requests #{}
+   :calendar/responses #{}})
 ```
 
 ### Value type
 
-```
-value TimeRange { start: Timestamp, end: Timestamp, duration: end - start }
+Value types are plain immutable Clojure values.
+
+```clojure
+(defn time-range [start end]
+  {:start start
+   :end end
+   :duration (- end start)})
 ```
 
 ### Sum type
 
-A base entity declares a discriminator field whose capitalised values name the variants. Variants use the `variant` keyword.
+Use tagged maps (`:kind` / `:type`) for variants.
 
-```
-entity Node {
-    path: Path
-    kind: Branch | Leaf              -- discriminator field
-}
+```clojure
+(def node-branch {:path "/" :kind :Branch :children [:node-1 :node-2]})
+(def node-leaf {:path "/tmp/a" :kind :Leaf :data [1 2 3] :log [7 8]})
 
-variant Branch : Node {
-    children: List<Node?>
-}
-
-variant Leaf : Node {
-    data: List<Integer>
-    log: List<Integer>
-}
+(defn process-node [node]
+  (case (:kind node)
+    :Branch {:children (:children node)}
+    :Leaf {:combined (concat (:data node) (:log node))}))
 ```
 
-Lowercase pipe values are enum literals (`status: pending | active`). Capitalised values are variant references (`kind: Branch | Leaf`). Type guards (`requires:` or `if` branches) narrow to a variant and unlock its fields.
+Use `case`, `cond`, or predicate guards in processes/invariants to narrow variants.
 
 ### Module given
 
-Declares the entity instances a module's rules operate on. All rules inherit these bindings. Not every module needs one: rules scoped by triggers on domain entities get their entities from the trigger. `given` is for specs where rules operate on shared instances that exist once per module scope.
+The model `global` map is the shared module context.
 
+```clojure
+(def global
+  {::pipeline {:status :active}
+   ::calendar {:available-slots #{:s1 :s2}}})
 ```
-given {
-    pipeline: HiringPipeline
-    calendar: InterviewCalendar
-}
-```
-
-Imported module instances are accessed via qualified names (`scheduling/calendar`) and do not appear in the local `given` block. Distinct from surface `context`, which binds a parametric scope for a boundary contract.
 
 ### Rule
 
-```
-rule InvitationExpires {
-    when: invitation: Invitation.expires_at <= now
-    requires: invitation.status = pending
-    let remaining = invitation.proposed_slots where status != cancelled
-    ensures: invitation.status = expired
-    ensures:
-        for s in remaining:
-            s.status = cancelled
-}
+Rules are process steps (`r/defproc`) that transition state.
+
+```clojure
+(ns model.invitation
+  (:require [recife.core :as r]))
+
+(r/defproc invitation-expires
+  (fn [{:keys [::invitations ::interview-slots :clock/now] :as db}]
+    (reduce-kv (fn [acc invitation-id invitation]
+                 (let [remaining-slot-ids (filter #(not= :cancelled
+                                                        (get-in acc [::interview-slots % :status]))
+                                                  (:proposed-slot-ids invitation))]
+                   (if (and (= :pending (:status invitation))
+                            (<= (:expires-at invitation) now))
+                     (let [acc' (assoc-in acc [::invitations invitation-id :status] :expired)]
+                       (reduce (fn [x sid]
+                                 (assoc-in x [::interview-slots sid :status] :cancelled))
+                               acc'
+                               remaining-slot-ids))
+                     acc)))
+               db
+               invitations)))
 ```
 
 ### Trigger types
 
-- **External stimulus**: `when: CandidateSelectsSlot(invitation, slot)` — action from outside the system
-- **State transition**: `when: interview: Interview.status transitions_to scheduled` — entity changed state (transition only, not creation)
-- **State becomes**: `when: interview: Interview.status becomes scheduled` — entity has this value, whether by creation or transition
-- **Temporal**: `when: invitation: Invitation.expires_at <= now` — time-based condition (always add a `requires` guard against re-firing)
-- **Derived condition**: `when: interview: Interview.all_feedback_in` — derived value becomes true
-- **Entity creation**: `when: batch: DigestBatch.created` — fires when a new entity is created
-- **Chained**: `when: AllConfirmationsResolved(candidacy)` — subscribes to a trigger emission from another rule's ensures clause
-
-All entity-scoped triggers use explicit `var: Type` binding. Use `_` as a discard binding where the name is not needed: `when: _: Invitation.expires_at <= now`, `when: SomeEvent(_, slot)`.
+- **External stimulus**: process consumes queued events (`:api/reqs`, `:webhook/reqs`)
+- **State transition**: process updates status/fields (`assoc-in`, `update-in`)
+- **State becomes**: guard matches target value (`when (= :scheduled status) ...`)
+- **Temporal**: guard compares time fields against `:now`
+- **Derived condition**: invariant/property observes computed condition
+- **Entity creation**: process inserts new map entry (`assoc-in`/`update`)
+- **Chained**: one process writes data consumed by another process
 
 ### Rule-level iteration
 
-A `for` clause applies the rule body once per element in a collection:
+Use regular Clojure iteration in process bodies.
 
-```
-rule ProcessDigests {
-    when: schedule: DigestSchedule.next_run_at <= now
-    for user in Users where notification_setting.digest_enabled:
-        let settings = user.notification_setting
-        ensures: DigestBatch.created(user: user, ...)
-}
+```clojure
+(r/defproc process-digests
+  (fn [{:keys [::digest-schedule ::users :clock/now] :as db}]
+    (if (<= (:next-run-at digest-schedule) now)
+      (reduce (fn [acc [user-id user]]
+                (if (get-in user [:notification-setting :digest-enabled])
+                  (update acc :digest/batches conj {:user-id user-id
+                                                    :created-at now})
+                  acc))
+              db
+              users)
+      db)))
 ```
 
 ### Ensures patterns
 
-Ensures clauses have four outcome forms:
+Recife outcomes are state transitions expressed in Clojure:
 
-- **State changes**: `entity.field = value`
-- **Entity creation**: `Entity.created(...)` — the single canonical creation verb
-- **Trigger emission**: `TriggerName(params)` — emits an event for other rules to chain from
-- **Entity removal**: `not exists entity` — asserts the entity no longer exists
-
-These forms compose with `for` iteration (`for x in collection: ...`), `if`/`else` conditionals and `let` bindings.
-
-Entity creation uses `.created()` exclusively. Domain meaning lives in entity names and rule names, not in creation verbs.
-
-In state change assignments, the right-hand expression references pre-rule field values. Conditions within ensures blocks (`if` guards, creation parameters, trigger emission parameters) reference the resulting state.
+- **State changes**: `assoc`, `assoc-in`, `update`, `update-in`
+- **Entity creation**: add map entries / append events to collections
+- **Trigger emission**: append to event queues for other processes
+- **Entity removal**: `dissoc` / `update` with `disj` or filtered collections
 
 ### Surface
 
+Boundary contracts are modelled explicitly as operations and visibility rules in state.
+
+```clojure
+(def global
+  {::slot-confirmations
+   {:sc-1 {:interviewer-id :i-1
+           :slot {:id :s-1 :time 1739786400000}
+           :status :pending
+           :interview-id :int-1}}
+   :surfaces/interviewer-dashboard
+   {:facing {:viewer-id :i-1}
+    :context {:assignment-id :sc-1}
+    :exposes #{:slot.time :status}
+    :provides [{:op :InterviewerConfirmsSlot
+                :args [:i-1 :s-1]
+                :when (fn [db]
+                        (= :pending (get-in db [::slot-confirmations :sc-1 :status])))}]
+    :related [{:surface :InterviewDetail
+               :args [:int-1]
+               :when (fn [db]
+                       (some? (get-in db [::slot-confirmations :sc-1 :interview-id])))}]}})
 ```
-surface InterviewerDashboard {
-    facing viewer: Interviewer
-
-    context assignment: SlotConfirmation where interviewer = viewer
-
-    exposes:
-        assignment.slot.time
-        assignment.status
-
-    provides:
-        InterviewerConfirmsSlot(viewer, assignment.slot)
-            when assignment.status = pending
-
-    related:
-        InterviewDetail(assignment.slot.interview)
-            when assignment.slot.interview != null
-}
-```
-
-Surfaces define contracts at boundaries. The `facing` clause names the external party, `context` scopes the entity. The remaining clauses use a single vocabulary regardless of whether the boundary is user-facing or code-to-code: `exposes` (visible data, supports `for` iteration over collections), `provides` (available operations with optional when-guards), `guarantee` (constraints that must hold), `guidance` (non-normative advice), `related` (associated surfaces reachable from this one), `timeout` (references to temporal rules that apply within the surface's context).
-
-The `facing` clause accepts either an actor type (with a corresponding `actor` declaration and `identified_by` mapping) or an entity type directly. Use actor declarations when the boundary has specific identity requirements; use entity types when any instance can interact (e.g., `facing visitor: User`). For integration surfaces where the external party is code, declare an actor type with a minimal `identified_by` expression. Actors that reference `within` in their `identified_by` expression must declare the expected context type: `within: Workspace`.
 
 ### Surface-to-implementation contract
 
-The `exposes` block is the field-level contract: the implementation returns exactly these fields, the consumer uses exactly these fields. Do not add fields not listed. Do not omit fields that are listed.
+Model the exact fields/actions each boundary exposes, then verify implementation traces against those expectations.
 
 ### Expressions
 
-Navigation: `interview.candidacy.candidate.email`, `reply_to?.author` (optional), `timezone ?? "UTC"` (null coalescing). Collections: `slots.count`, `slot in invitation.slots`, `interviewers.any(i => i.can_solo)`, `for item in collection: item.status = cancelled`, `permissions + inherited` (set union), `old - new` (set difference). Comparisons: `status = pending`, `count >= 2`, `status in {confirmed, declined}`, `provider not in providers`. Boolean logic: `a and b`, `a or b`, `not a`.
+Use plain Clojure expressions (`get-in`, `assoc-in`, `update`, `filter`, `some`, `every?`, `contains?`, arithmetic, boolean logic) inside processes, invariants and temporal properties.
 
 ### Modular specs
 
-```
-use "github.com/allium-specs/google-oauth/abc123def" as oauth
+Split models into namespaces and require them from composition namespaces.
+
+```clojure
+(ns app.model
+  (:require [recife.core :as r]))
+
+(def dependencies
+  {:oauth {:source "github.com/recife-models/google-oauth/abc123def"}
+   :candidacy {:source "./candidacy.clj"}})
+
+(def qualified-refs
+  {:session [:oauth/session]
+   :candidacy [:candidacy/candidacy]})
 ```
 
-Qualified names reference entities across specs: `oauth/Session`. Coordinates are immutable (git SHAs or content hashes). Local specs use relative paths: `use "./candidacy.allium" as candidacy`.
+Local references use relative Clojure namespaces/files, e.g. `app/model/scheduling.clj`.
 
 ### Config
 
-```
-config {
-    invitation_expiry: Duration = 7.days
-    max_login_attempts: Integer = 5
-}
-```
+Use explicit config maps in the model state.
 
-Rules reference config values as `config.invitation_expiry`. For default entity instances, use `default`.
+```clojure
+(def global
+  {::config {:invitation-expiry-ms (* 7 24 60 60 1000)
+             :max-login-attempts 5}})
+```
 
 ### Defaults
 
-```
-default Role viewer = { name: "viewer", permissions: { "documents.read" } }
+Provide default model entities directly in `global`.
+
+```clojure
+(def global
+  {::roles {:viewer {:name "viewer"
+                     :permissions #{:documents.read}}}})
 ```
 
 ### Deferred specs
 
-```
-deferred InterviewerMatching.suggest    -- see: detailed/interviewer-matching.allium
+Represent deferred logic as placeholder functions/processes and annotate TODO links.
+
+```clojure
+(defn interviewer-matching-suggest
+  [_db]
+  ;; see: detailed/interviewer_matching.clj
+  (throw (ex-info "Deferred model" {})))
 ```
 
 ### Open questions
 
-```
-open question "Admin ownership - should admins be assigned to specific roles?"
+Track unresolved design choices as explicit comments near the model.
+
+```clojure
+(comment
+  "Open question: should admins be assigned to specific roles?")
 ```
 
 ## References
 
-- [Language reference](./references/language-reference.md) — full syntax for entities, rules, expressions, surfaces and validation
-- [Test generation](./references/test-generation.md) — generating tests from specifications
-- [Patterns](./references/patterns.md) — 8 worked patterns: auth, RBAC, invitations, soft delete, notifications, usage limits, comments, library spec integration
+- [Language reference](./references/language-reference.md) — full Recife model syntax and conventions
+- [Test generation](./references/test-generation.md) — deriving tests from Recife models
+- [Patterns](./references/patterns.md) — worked Recife patterns for auth, RBAC, invitations, soft delete, notifications, quotas, comments and integrations

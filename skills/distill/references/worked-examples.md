@@ -1,6 +1,6 @@
 # Worked examples: from code to spec
 
-These examples show real implementations in Python and TypeScript, then walk through extracting the Allium specification.
+These examples show real implementations in Python and TypeScript, then walk through extracting equivalent Recife model components.
 
 ## Example 1: Password Reset (Python/Flask)
 
@@ -187,88 +187,96 @@ def cleanup_expired_tokens():
    - Remove: `render_template`, URL construction
    - Keep: durations (1 hour, 12 characters)
 
-**Extracted Allium spec:**
+**Extracted Recife model:**
 
-```
--- password-reset.allium
+```clojure
+;; password-reset.model.clj
+(ns worked.password-reset.model
+  (:require [recife.core :as r]))
 
-config {
-    reset_token_expiry: Duration = 1.hour
-    min_password_length: Integer = 12
-}
+(def global
+  {::config {:reset-token-expiry-ms (* 60 60 1000) ; 1.hour
+             :min-password-length 12}
+   ::users {}
+   ::reset-tokens {}
+   ::sessions {}
+   :auth/request-password-reset #{}
+   :auth/complete-password-reset #{}
+   :mail/outbox []
+   :clock/now 0})
 
-entity User {
-    email: String
-    password_hash: String
-    status: active | locked | deactivated
-    failed_login_attempts: Integer
-    locked_until: Timestamp?
+(defn token-valid? [token now]
+  (and (= :pending (:status token))
+       (> (:expires-at token) now)))
 
-    reset_tokens: PasswordResetToken with user = this
-    sessions: Session with user = this
+(defn hash-password [raw]
+  (str "hash:" raw))
 
-    active_sessions: sessions with status = active
-    pending_reset_tokens: reset_tokens with status = pending
-}
+(r/defproc request-password-reset
+  (fn [{:keys [:auth/request-password-reset ::users ::reset-tokens ::config :clock/now] :as db}]
+    (when-let [{:keys [email]} (first request-password-reset)]
+      (when-let [[user-id user] (first (filter (fn [[_ u]] (= email (:email u))) users))]
+        (when (contains? #{:active :locked} (:status user))
+          (let [token-id (keyword (str "token-" (inc (count reset-tokens))))
+                db' (-> db
+                        (update :auth/request-password-reset disj {:email email})
+                        (update ::reset-tokens
+                                (fn [tokens]
+                                  (into {}
+                                        (map (fn [[tid token]]
+                                               [tid (if (and (= user-id (:user-id token))
+                                                             (= :pending (:status token)))
+                                                      (assoc token :status :expired)
+                                                      token)]))
+                                        tokens)))
+                        (assoc-in [::reset-tokens token-id]
+                                  {:user-id user-id
+                                   :created-at now
+                                   :expires-at (+ now (get-in db [::config :reset-token-expiry-ms]))
+                                   :status :pending}))]
+            (update db' :mail/outbox conj
+                    {:to (:email user)
+                     :template :password-reset
+                     :data {:token-id token-id}})))))))
 
-entity PasswordResetToken {
-    user: User
-    created_at: Timestamp
-    expires_at: Timestamp
-    status: pending | used | expired
+(r/defproc complete-password-reset
+  (fn [{:keys [:auth/complete-password-reset ::reset-tokens ::users ::sessions ::config :clock/now] :as db}]
+    (when-let [{:keys [token-id new-password]} (first complete-password-reset)]
+      (let [token (get reset-tokens token-id)]
+        (when (and token
+                   (token-valid? token now)
+                   (>= (count new-password) (get-in config [:min-password-length])))
+          (let [user-id (:user-id token)
+                user (get users user-id)
+                db' (-> db
+                        (update :auth/complete-password-reset disj {:token-id token-id :new-password new-password})
+                        (assoc-in [::reset-tokens token-id :status] :used)
+                        (assoc-in [::users user-id :password-hash] (hash-password new-password))
+                        (assoc-in [::users user-id :status] :active)
+                        (assoc-in [::users user-id :failed-login-attempts] 0)
+                        (assoc-in [::users user-id :locked-until] nil)
+                        (update ::sessions
+                                (fn [all-sessions]
+                                  (into {}
+                                        (map (fn [[sid session]]
+                                               [sid (if (and (= user-id (:user-id session))
+                                                             (= :active (:status session)))
+                                                      (assoc session :status :revoked)
+                                                      session)]))
+                                        all-sessions))))]
+            (update db' :mail/outbox conj
+                    {:to (:email user)
+                     :template :password-changed})))))))
 
-    is_valid: status = pending and expires_at > now
-}
-
-rule RequestPasswordReset {
-    when: UserRequestsPasswordReset(email)
-
-    let user = User{email}
-
-    requires: exists user
-    requires: user.status in {active, locked}
-
-    ensures:
-        for t in user.pending_reset_tokens:
-            t.status = expired
-    ensures:
-        let token = PasswordResetToken.created(
-            user: user,
-            created_at: now,
-            expires_at: now + config.reset_token_expiry,
-            status: pending
-        )
-        Email.created(
-            to: user.email,
-            template: password_reset,
-            data: { token: token }
-        )
-}
-
-rule CompletePasswordReset {
-    when: UserResetsPassword(token, new_password)
-
-    requires: token.is_valid
-    requires: length(new_password) >= config.min_password_length
-
-    let user = token.user
-
-    ensures: token.status = used
-    ensures: user.password_hash = hash(new_password)
-    ensures: user.status = active
-    ensures: user.failed_login_attempts = 0
-    ensures: user.locked_until = null
-    ensures:
-        for s in user.active_sessions:
-            s.status = revoked
-    ensures: Email.created(to: user.email, template: password_changed)
-}
-
-rule ResetTokenExpires {
-    when: token: PasswordResetToken.expires_at <= now
-    requires: token.status = pending
-    ensures: token.status = expired
-}
+(r/defproc reset-token-expires
+  (fn [{:keys [::reset-tokens :clock/now] :as db}]
+    (reduce-kv (fn [acc token-id token]
+                 (if (and (= :pending (:status token))
+                          (<= (:expires-at token) now))
+                   (assoc-in acc [::reset-tokens token-id :status] :expired)
+                   acc))
+               db
+               reset-tokens)))
 ```
 
 **What we removed:**
@@ -556,143 +564,134 @@ export async function changePlan(req: Request, res: Response) {
    - Check limit becomes `requires: workspace.can_add_project`
    - Return error with upgrade path becomes a separate rule for limit reached
 
-**Extracted Allium spec:**
+**Extracted Recife model:**
 
-```
--- usage-limits.allium
+```clojure
+;; usage-limits.model.clj
+(ns worked.usage-limits.model
+  (:require [recife.core :as r]))
 
-entity Plan {
-    name: String
-    max_projects: Integer           -- -1 = unlimited
-    max_storage_mb: Integer
-    max_team_members: Integer
-    monthly_price: Decimal
-    features: Set<Feature>          -- domain type; define in your spec
+(def global
+  {::plans {}
+   ::workspaces {}
+   ::workspace-memberships {} ; [workspace-id user-id] -> {:can-admin true/false}
+   ::projects {}
+   ::usage-events []
+   :workspace/create-project #{}
+   :workspace/change-plan #{}
+   :notifications/outbox []
+   :mail/outbox []})
 
-    has_unlimited_projects: max_projects = -1
-    has_unlimited_storage: max_storage_mb = -1
-    has_unlimited_members: max_team_members = -1
-}
+(defn calculate-storage-mb [_db _workspace-id]
+  0)
 
-entity Workspace {
-    name: String
-    owner: User
-    plan: Plan
+(defn workspace-project-count [db workspace-id]
+  (->> (::projects db)
+       vals
+       (filter #(and (= workspace-id (:workspace-id %))
+                     (nil? (:deleted-at %))))
+       count))
 
-    members: WorkspaceMembership with workspace = this
-    all_projects: Project with workspace = this
+(defn workspace-member-count [db workspace-id]
+  (->> (::workspace-memberships db)
+       keys
+       (filter (fn [[wid _]] (= workspace-id wid)))
+       count))
 
-    -- Projections
-    projects: all_projects with deleted_at = null
+(defn has-unlimited? [n]
+  (= -1 n))
 
-    -- Usage calculations
-    project_count: projects.count
-    storage_mb: calculate_storage(this)         -- black box
-    member_count: members.count
+(defn can-add-project? [db workspace]
+  (let [plan (get-in db [::plans (:plan-id workspace)])
+        limit (:max-projects plan)]
+    (or (has-unlimited? limit)
+        (< (workspace-project-count db (:id workspace)) limit))))
 
-    -- Limit checks
-    can_add_project:
-        plan.has_unlimited_projects
-        or project_count < plan.max_projects
+(r/defproc create-project
+  (fn [{:keys [:workspace/create-project ::workspaces ::workspace-memberships] :as db}]
+    (when-let [{:keys [user-id workspace-id name]} (first create-project)]
+      (let [workspace (get workspaces workspace-id)
+            membership (get workspace-memberships [workspace-id user-id])]
+        (when (and workspace membership (can-add-project? db workspace))
+          (let [project-id (keyword (str "project-" (inc (count (::projects db)))))]
+            (-> db
+                (update :workspace/create-project disj {:user-id user-id :workspace-id workspace-id :name name})
+                (assoc-in [::projects project-id]
+                          {:workspace-id workspace-id
+                           :name name
+                           :created-by user-id
+                           :deleted-at nil})
+                (update ::usage-events conj {:workspace-id workspace-id
+                                             :type :project-created}))))))))
 
-    can_add_member:
-        plan.has_unlimited_members
-        or member_count < plan.max_team_members
+(r/defproc create-project-limit-reached
+  (fn [{:keys [:workspace/create-project ::workspaces ::workspace-memberships] :as db}]
+    (when-let [{:keys [user-id workspace-id name] :as cmd} (first create-project)]
+      (let [workspace (get workspaces workspace-id)
+            membership (get workspace-memberships [workspace-id user-id])
+            plan (get-in db [::plans (:plan-id workspace)])]
+        (when (and workspace membership (not (can-add-project? db workspace)))
+          (-> db
+              (update :workspace/create-project disj cmd)
+              (update :notifications/outbox conj
+                      {:user-id user-id
+                       :about :limit-reached
+                       :data {:limit-type :projects
+                              :current (workspace-project-count db workspace-id)
+                              :max (:max-projects plan)
+                              :name name}})))))))
 
-    can_add_storage(size_mb):
-        plan.has_unlimited_storage
-        or storage_mb + size_mb <= plan.max_storage_mb
+(r/defproc change-plan
+  (fn [{:keys [:workspace/change-plan ::workspaces ::plans] :as db}]
+    (when-let [{:keys [user-id workspace-id new-plan-id] :as cmd} (first change-plan)]
+      (let [workspace (get workspaces workspace-id)
+            old-plan (some->> workspace :plan-id (get plans))
+            new-plan (get plans new-plan-id)
+            is-downgrade (< (:monthly-price new-plan) (:monthly-price old-plan))
+            project-ok (or (not is-downgrade)
+                           (has-unlimited? (:max-projects new-plan))
+                           (<= (workspace-project-count db workspace-id) (:max-projects new-plan)))
+            storage-ok (or (not is-downgrade)
+                           (has-unlimited? (:max-storage-mb new-plan))
+                           (<= (calculate-storage-mb db workspace-id) (:max-storage-mb new-plan)))
+            members-ok (or (not is-downgrade)
+                           (has-unlimited? (:max-team-members new-plan))
+                           (<= (workspace-member-count db workspace-id) (:max-team-members new-plan)))]
+        (when (and workspace
+                   (= user-id (:owner-id workspace))
+                   project-ok
+                   storage-ok
+                   members-ok)
+          (-> db
+              (update :workspace/change-plan disj cmd)
+              (assoc-in [::workspaces workspace-id :plan-id] new-plan-id)
+              (update :mail/outbox conj
+                      {:to (:owner-email workspace)
+                       :template (if is-downgrade :plan-downgraded :plan-upgraded)
+                       :data {:old-plan old-plan :new-plan new-plan}})))))))
 
-    can_use_feature(f): f in plan.features
-}
-
-entity WorkspaceMembership {
-    workspace: Workspace
-    user: User
-}
-
-rule CreateProject {
-    when: CreateProject(user, workspace, name)
-
-    let membership = WorkspaceMembership{workspace, user}
-
-    requires: exists membership
-    requires: workspace.can_add_project
-
-    ensures: Project.created(
-        workspace: workspace,
-        name: name,
-        created_by: user
-    )
-    ensures: UsageEvent.created(
-        workspace: workspace,
-        type: project_created
-    )
-}
-
-rule CreateProjectLimitReached {
-    when: CreateProject(user, workspace, name)
-
-    let membership = WorkspaceMembership{workspace, user}
-
-    requires: exists membership
-    requires: not workspace.can_add_project
-
-    ensures: UserInformed(
-        user: user,
-        about: limit_reached,
-        data: {
-            limit_type: projects,
-            current: workspace.project_count,
-            max: workspace.plan.max_projects
-        }
-    )
-}
-
-rule ChangePlan {
-    when: ChangePlan(user, workspace, new_plan)
-
-    requires: user = workspace.owner
-
-    let is_downgrade = new_plan.monthly_price < workspace.plan.monthly_price
-    let old_plan = workspace.plan
-
-    requires: not is_downgrade
-              or (workspace.project_count <= new_plan.max_projects
-                  or new_plan.has_unlimited_projects)
-    requires: not is_downgrade
-              or (workspace.storage_mb <= new_plan.max_storage_mb
-                  or new_plan.has_unlimited_storage)
-    requires: not is_downgrade
-              or (workspace.member_count <= new_plan.max_team_members
-                  or new_plan.has_unlimited_members)
-
-    ensures: workspace.plan = new_plan
-    ensures: Email.created(
-        to: workspace.owner.email,
-        template: if is_downgrade: plan_downgraded else: plan_upgraded,
-        data: { old_plan: old_plan, new_plan: new_plan }
-    )
-}
-
-rule DowngradeBlocked {
-    when: ChangePlan(user, workspace, new_plan)
-
-    requires: user = workspace.owner
-    requires: new_plan.monthly_price < workspace.plan.monthly_price
-    requires: workspace.project_count > new_plan.max_projects
-              and not new_plan.has_unlimited_projects
-
-    ensures: UserInformed(
-        user: user,
-        about: downgrade_blocked,
-        data: {
-            reason: projects,
-            current: workspace.project_count,
-            limit: new_plan.max_projects
-        }
-    )
-}
+(r/defproc downgrade-blocked
+  (fn [{:keys [:workspace/change-plan ::workspaces ::plans] :as db}]
+    (when-let [{:keys [user-id workspace-id new-plan-id] :as cmd} (first change-plan)]
+      (let [workspace (get workspaces workspace-id)
+            old-plan (some->> workspace :plan-id (get plans))
+            new-plan (get plans new-plan-id)
+            is-downgrade (< (:monthly-price new-plan) (:monthly-price old-plan))
+            project-count (workspace-project-count db workspace-id)
+            project-limit (:max-projects new-plan)]
+        (when (and workspace
+                   (= user-id (:owner-id workspace))
+                   is-downgrade
+                   (not (has-unlimited? project-limit))
+                   (> project-count project-limit))
+          (-> db
+              (update :workspace/change-plan disj cmd)
+              (update :notifications/outbox conj
+                      {:user-id user-id
+                       :about :downgrade-blocked
+                       :data {:reason :projects
+                              :current project-count
+                              :limit project-limit}})))))))
 ```
 
 **What we removed:**
@@ -907,91 +906,97 @@ public class RetentionCleanupJob {
    - Restore: original deleter OR admin
    - Permanent delete: admin only
 
-**Extracted Allium spec:**
+**Extracted Recife model:**
 
-```
--- soft-delete.allium
+```clojure
+;; soft-delete.model.clj
+(ns worked.soft-delete.model
+  (:require [recife.core :as r]))
 
-config {
-    retention_period: Duration = 30.days
-}
+(def global
+  {::config {:retention-period-ms (* 30 24 60 60 1000)} ; 30.days
+   ::documents {}
+   ::workspace-memberships {} ; [workspace-id user-id] -> {:can-admin true/false}
+   :document/delete #{}
+   :document/restore #{}
+   :document/permanently-delete #{}
+   :workspace/empty-trash #{}
+   :clock/now 0})
 
-entity Document {
-    workspace: Workspace
-    title: String
-    content: String
-    created_by: User
-    created_at: Timestamp
-    status: active | deleted
-    deleted_at: Timestamp?
-    deleted_by: User?
+(defn can-restore? [db document]
+  (and (= :deleted (:status document))
+       (some? (:deleted-at document))
+       (> (+ (:deleted-at document)
+             (get-in db [::config :retention-period-ms]))
+          (:clock/now db))))
 
-    retention_expires_at: deleted_at + config.retention_period
-    can_restore: status = deleted and retention_expires_at > now
-}
+(defn membership-can-admin? [db workspace-id user-id]
+  (true? (get-in db [::workspace-memberships [workspace-id user-id] :can-admin])))
 
-entity Workspace {
-    all_documents: Document with workspace = this
+(r/defproc delete-document
+  (fn [{:keys [:document/delete ::documents] :as db}]
+    (when-let [{:keys [actor-id document-id] :as cmd} (first delete)]
+      (let [document (get documents document-id)]
+        (when (and document
+                   (= :active (:status document))
+                   (or (= actor-id (:created-by document))
+                       (membership-can-admin? db (:workspace-id document) actor-id)))
+          (-> db
+              (update :document/delete disj cmd)
+              (assoc-in [::documents document-id :status] :deleted)
+              (assoc-in [::documents document-id :deleted-at] (:clock/now db))
+              (assoc-in [::documents document-id :deleted-by] actor-id)))))))
 
-    documents: all_documents with status = active
-    deleted_documents: all_documents with status = deleted
-    restorable_documents: all_documents with can_restore = true
-}
+(r/defproc restore-document
+  (fn [{:keys [:document/restore ::documents] :as db}]
+    (when-let [{:keys [actor-id document-id] :as cmd} (first restore)]
+      (let [document (get documents document-id)]
+        (when (and document
+                   (can-restore? db document)
+                   (or (= actor-id (:deleted-by document))
+                       (membership-can-admin? db (:workspace-id document) actor-id)))
+          (-> db
+              (update :document/restore disj cmd)
+              (assoc-in [::documents document-id :status] :active)
+              (assoc-in [::documents document-id :deleted-at] nil)
+              (assoc-in [::documents document-id :deleted-by] nil)))))))
 
-rule DeleteDocument {
-    when: DeleteDocument(actor, document)
+(r/defproc permanently-delete
+  (fn [{:keys [:document/permanently-delete ::documents] :as db}]
+    (when-let [{:keys [actor-id document-id] :as cmd} (first permanently-delete)]
+      (let [document (get documents document-id)]
+        (when (and document
+                   (= :deleted (:status document))
+                   (membership-can-admin? db (:workspace-id document) actor-id))
+          (-> db
+              (update :document/permanently-delete disj cmd)
+              (update ::documents dissoc document-id)))))))
 
-    let membership = WorkspaceMembership{workspace: document.workspace, user: actor}
+(r/defproc empty-trash
+  (fn [{:keys [:workspace/empty-trash ::documents] :as db}]
+    (when-let [{:keys [actor-id workspace-id] :as cmd} (first empty-trash)]
+      (when (membership-can-admin? db workspace-id actor-id)
+        (-> db
+            (update :workspace/empty-trash disj cmd)
+            (update ::documents
+                    (fn [docs]
+                      (into {}
+                            (remove (fn [[_ doc]]
+                                      (and (= workspace-id (:workspace-id doc))
+                                           (= :deleted (:status doc)))))
+                            docs))))))))
 
-    requires: document.status = active
-    requires: actor = document.created_by or membership.can_admin
-
-    ensures: document.status = deleted
-    ensures: document.deleted_at = now
-    ensures: document.deleted_by = actor
-}
-
-rule RestoreDocument {
-    when: RestoreDocument(actor, document)
-
-    let membership = WorkspaceMembership{workspace: document.workspace, user: actor}
-
-    requires: document.can_restore
-    requires: actor = document.deleted_by or membership.can_admin
-
-    ensures: document.status = active
-    ensures: document.deleted_at = null
-    ensures: document.deleted_by = null
-}
-
-rule PermanentlyDelete {
-    when: PermanentlyDelete(actor, document)
-
-    let membership = WorkspaceMembership{workspace: document.workspace, user: actor}
-
-    requires: document.status = deleted
-    requires: membership.can_admin
-
-    ensures: not exists document
-}
-
-rule EmptyTrash {
-    when: EmptyTrash(actor, workspace)
-
-    let membership = WorkspaceMembership{workspace: workspace, user: actor}
-
-    requires: membership.can_admin
-
-    ensures:
-        for d in workspace.deleted_documents:
-            not exists d
-}
-
-rule RetentionExpires {
-    when: document: Document.retention_expires_at <= now
-    requires: document.status = deleted
-    ensures: not exists document
-}
+(r/defproc retention-expires
+  (fn [{:keys [::documents :clock/now] :as db}]
+    (reduce-kv (fn [acc document-id document]
+                 (let [retention-expires-at (+ (:deleted-at document)
+                                               (get-in db [::config :retention-period-ms]))]
+                   (if (and (= :deleted (:status document))
+                            (<= retention-expires-at now))
+                     (update acc ::documents dissoc document-id)
+                     acc)))
+               db
+               documents)))
 ```
 
 **Key observations:**

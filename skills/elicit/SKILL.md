@@ -1,44 +1,48 @@
 ---
 name: elicit
-description: This skill should be used when the user wants to "build an allium spec", "elicit requirements", "capture domain behaviour", "specify a feature", or is describing functionality they want to build and needs guidance on extracting a specification through conversation.
+description: This skill should be used when the user wants to "build a recife model", "elicit requirements", "capture domain behaviour", "specify a feature", or is describing functionality they want to build and needs guidance on extracting an executable model through conversation.
 ---
 
 # Elicitation
 
-This skill guides you through building Allium specifications by conversation. The goal is to surface ambiguities and produce a specification that captures what the software does without prescribing implementation.
+This skill guides you through building Recife model specifications by conversation. The goal is to surface ambiguities and produce a model that captures what the software does without prescribing implementation detail.
 
 The same principles apply to distillation. Whether you are hearing a stakeholder describe a feature or reading code that implements it, the challenge is identical: finding the right level of abstraction.
 
 ## Scoping the specification
 
-Before diving into details, establish what you are specifying. Not everything needs to be in one spec.
+Before diving into details, establish what you are specifying. Not everything needs to be in one model.
 
 ### Questions to ask first
 
 **"What's the boundary of this specification?"** A complete system? A single feature area? One service in a larger system? Be explicit about what is in and out of scope.
 
-**"Are there areas we should deliberately exclude?"** Third-party integrations might be library specs. Legacy features might not be worth specifying. Some features might belong in separate specs.
+**"Are there areas we should deliberately exclude?"** Third-party integrations might be library models. Legacy features might not be worth specifying. Some features might belong in separate models.
 
 **"Is this a new system or does code already exist?"** If code exists, you are doing distillation with elicitation. Existing code constrains what is realistic to specify.
 
 ### Documenting scope decisions
 
-Capture scope at the start of every spec:
+Capture scope at the start of every model:
 
+```clojure
+(ns interview-scheduling.model
+  (:require [recife.core :as r]
+            [recife.helpers :as rh]))
+
+;; Scope: Interview scheduling for the hiring pipeline
+;; Includes: candidacy, interview, slot management, invitations, feedback
+;; Excludes:
+;;   - authentication (use oauth model)
+;;   - payments (not applicable)
+;;   - reporting dashboards (separate model)
+;; Dependencies: user entity defined in core.model.clj
+
+(def global
+  {::config {:invitation-expiry-ms (* 7 24 60 60 1000)}})
 ```
--- allium: 1
--- interview-scheduling.allium
 
--- Scope: Interview scheduling for the hiring pipeline
--- Includes: Candidacy, Interview, Slot management, Invitations, Feedback
--- Excludes:
---   - Authentication (use oauth library spec)
---   - Payments (not applicable)
---   - Reporting dashboards (separate spec)
--- Dependencies: User entity defined in core.allium
-```
-
-The version marker (`-- allium: N`) must be the first line of every `.allium` file. Use the version number from the root Allium skill's `version` frontmatter field.
+Use a namespace declaration as the first form of every model `.clj` file, then record scope comments directly above `global` and the first process definitions.
 
 ## Finding the right level of abstraction
 
@@ -66,7 +70,7 @@ Ask: "Could this be implemented differently while still being the same system?"
 
 Examples:
 
-- "Notifications sent via Slack". Could be email, SMS, etc. Abstract to `Notification.created(channel: ...)`.
+- "Notifications sent via Slack". Could be email, SMS, etc. Abstract to an emitted notification event in model state.
 - "Interviewers must confirm within 3 hours". This specific deadline matters at the domain level. Include the duration.
 - "We use PostgreSQL". Could be any database. Do not include.
 - "Data is retained for 7 years for compliance". Regulatory requirement. Include.
@@ -96,7 +100,7 @@ Product level:         "Candidates can accept or decline interview invitations"
 Too concrete:          "Candidates click a button that POST to /api/invitations/:id/accept"
 ```
 
-**Signs you are too abstract.** The spec could describe almost any system. No testable assertions. Product owner says "but that doesn't capture..."
+**Signs you are too abstract.** The model could describe almost any system. No checkable assertions. Product owner says "but that doesn't capture..."
 
 **Signs you are too concrete.** You are mentioning technologies, frameworks or APIs. You are describing UI elements (buttons, pages, forms). The implementation team says "why are you dictating how we build this?"
 
@@ -108,45 +112,57 @@ When you encounter a specific value (3 hours, 7 days, etc.), ask:
 2. **Might it vary per deployment or customer?** Make it configurable.
 3. **Is it arbitrary?** Consider whether to include it at all.
 
-```
--- Hardcoded design decision
-rule InvitationExpires {
-    when: invitation: Invitation.created_at + 7.days <= now
-    ...
-}
+```clojure
+;; Hardcoded design decision
+(r/defproc invitation-expires
+  (fn [{:keys [::invitations :clock/now] :as db}]
+    (reduce-kv (fn [acc invitation-id invitation]
+                 (if (<= (+ (:created-at invitation) (* 7 24 60 60 1000)) now)
+                   (assoc-in acc [::invitations invitation-id :status] :expired)
+                   acc))
+               db
+               invitations)))
 
--- Configurable
-config {
-    invitation_expiry: Duration = 7.days
-}
+;; Configurable
+(def global
+  {::config {:invitation-expiry-ms (* 7 24 60 60 1000)}
+   ::invitations {}})
 
-rule InvitationExpires {
-    when: invitation: Invitation.created_at + config.invitation_expiry <= now
-    ...
-}
+(r/defproc invitation-expires
+  (fn [{:keys [::invitations ::config :clock/now] :as db}]
+    (reduce-kv (fn [acc invitation-id invitation]
+                 (if (<= (+ (:created-at invitation)
+                            (:invitation-expiry-ms config))
+                         now)
+                   (assoc-in acc [::invitations invitation-id :status] :expired)
+                   acc))
+               db
+               invitations)))
 ```
 
 ### Black boxes
 
 Some logic is important but belongs at a different level:
 
-```
--- Black box: we know it exists and what it considers, but not how
-ensures: Suggestion.created(
-    interviewers: InterviewerMatching.suggest(
-        considering: {
-            role.required_skills,
-            Interviewer.skills,
-            Interviewer.availability,
-            Interviewer.recent_load
-        }
-    )
-)
+```clojure
+(defn interviewer-matching-suggest
+  [{:keys [role-skills interviewer-skills interviewer-availability interviewer-load]}]
+  ;; Black box: we know required inputs/outputs, but not internals here.
+  (throw (ex-info "Defined in detailed model" {:inputs [role-skills interviewer-skills interviewer-availability interviewer-load]})))
+
+(r/defproc create-suggestion
+  (fn [{:keys [::role ::interviewers] :as db}]
+    (update db ::suggestions conj
+            {:interviewers (interviewer-matching-suggest
+                            {:role-skills (:required-skills role)
+                             :interviewer-skills (map :skills interviewers)
+                             :interviewer-availability (map :availability interviewers)
+                             :interviewer-load (map :recent-load interviewers)})})))
 ```
 
-The spec says there is a matching algorithm, that it considers these inputs and that it produces interviewer suggestions. The spec does not say how matching works, what weights are used or the specific algorithm.
+The model says there is a matching algorithm, that it considers these inputs and that it produces interviewer suggestions. The model does not say how matching works, what weights are used or the specific algorithm.
 
-This is the right level when the algorithm is complex and evolving, when product owners care about inputs and outputs rather than internals, and when a separate detailed spec could cover it if needed.
+This is the right level when the algorithm is complex and evolving, when product owners care about inputs and outputs rather than internals, and when a separate detailed model could cover it if needed.
 
 ## Elicitation methodology
 
@@ -203,7 +219,7 @@ Questions to ask:
 5. "When should a human be alerted to intervene?"
 6. "What if [external system] is unavailable?"
 
-**Technique:** For each rule, ask "what are all the ways requires could fail?"
+**Technique:** For each transition, ask "what are all the ways this guard could fail?"
 
 **Outputs:** Timeout and deadline rules. Retry and escalation logic. Error states. Recovery paths.
 
@@ -211,18 +227,18 @@ Questions to ask:
 
 ### Phase 4: Refinement
 
-**Goal:** Clean up the specification and identify gaps.
+**Goal:** Clean up the model and identify gaps.
 
 Questions to ask:
 
 1. "Looking at [entity], are these states complete? Can it be in any other state?"
 2. "Is there anything we haven't covered?"
-3. "This rule references [X], do we need to define that, or is it external?"
-4. "Is this detail essential here, or should it live in a detailed spec?"
+3. "This process references [X], do we need to define that, or is it external?"
+4. "Is this detail essential here, or should it live in a detailed model?"
 
-**Technique:** Read back the spec and ask "does this match your mental model?"
+**Technique:** Read back the model and ask "does this match your mental model?"
 
-**Outputs:** Complete entity definitions. Open questions documented. Deferred specifications identified. External boundaries confirmed.
+**Outputs:** Complete entity/state definitions. Open questions documented. Deferred model components identified. External boundaries confirmed.
 
 ## Elicitation principles
 
@@ -261,8 +277,9 @@ Better to record an open question than assume.
 
 "I'm not sure whether declining should return the candidate to the pool or remove them entirely. Let me note that as an open question."
 
-```
-open_question "When candidate declines, do they return to pool or exit?"
+```clojure
+(comment
+  "Open question: when candidate declines, do they return to pool or exit?")
 ```
 
 ### Use concrete examples
@@ -281,7 +298,7 @@ It is normal to revise earlier decisions.
 
 Not everything needs to be specified now.
 
-"This is getting into how the matching algorithm works. Should we defer that to a detailed spec?"
+"This is getting into how the matching algorithm works. Should we defer that to a detailed model?"
 
 "We've covered the main flow. The reporting dashboard sounds like a separate specification."
 
@@ -309,15 +326,15 @@ Watch for actions without clear actors. "You said 'the slots are released'. Who 
 
 ### The "Equivalent Terms" trap
 
-When you hear two terms for the same concept, from different stakeholders, existing code or related specs, stop and resolve it before continuing.
+When you hear two terms for the same concept, from different stakeholders, existing code or related models, stop and resolve it before continuing.
 
 "You said 'Purchase' but earlier we called this an 'Order'. Which term should we use?"
 
-A comment noting that two terms are equivalent is not a resolution. It guarantees both will appear in the implementation. Pick one term, cross-reference related specs and update all references. Do not leave the old term anywhere, not even in "see also" notes.
+A comment noting that two terms are equivalent is not a resolution. It guarantees both will appear in the implementation. Pick one term, cross-reference related models and update all references. Do not leave the old term anywhere, not even in "see also" notes.
 
 ## Elicitation session structure
 
-**Opening (5 min).** Explain Allium briefly: "We're capturing what the software does, not how it's built." Set expectations: "I'll ask lots of questions, some obvious-seeming." Agree on scope for this session.
+**Opening (5 min).** Explain Recife briefly: "We're capturing what the software does in an executable model, not prescribing implementation internals." Set expectations: "I'll ask lots of questions, some obvious-seeming." Agree on scope for this session.
 
 **Scope definition (10-15 min).** Identify actors, entities, boundaries. Get the one-sentence description.
 
@@ -327,9 +344,9 @@ A comment noting that two terms are equivalent is not a resolution. It guarantee
 
 **Wrap-up (5-10 min).** Read back key decisions. List open questions. Identify next session scope if needed.
 
-**After session.** Write up specification draft. Send for review. Note questions for next session.
+**After session.** Write up model draft. Send for review. Note questions for next session.
 
 ## References
 
-- [Language reference](../../references/language-reference.md) — full Allium syntax
-- [Recognising library spec opportunities](./references/library-spec-signals.md) — signals, questions and decision framework for identifying library specs during elicitation
+- [Language reference](../../references/language-reference.md) — full Recife model syntax
+- [Recognising library model opportunities](./references/library-spec-signals.md) — signals, questions and decision framework for identifying reusable integration models during elicitation
