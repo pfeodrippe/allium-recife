@@ -67,39 +67,43 @@ Recife provides executable Clojure syntax for describing transitions, constraint
 
 ```clojure
 (ns model.password-reset
-  (:require [recife.core :as r]
-            [recife.helpers :as rh]))
+  (:require [recife.core :as r]))
 
 (def global
-  {::users {:u-1 {:email "ana@example.com"
-                  :status :active
-                  :pending-reset-tokens #{:t-1}}}
-   ::reset-tokens {:t-1 {:user-id :u-1 :status :pending}}
+  {::config {:reset-token-expiry-ms (* 24 60 60 1000)}
+   ::users {:u-1 {:email "ana@example.com" :status :active}
+            :u-2 {:email "bob@example.com" :status :locked}}
+   ::reset-tokens {}
+   :auth/request-password-reset #{}
    :mail/outbox []
-   ::config {:reset-token-expiry-ms (* 24 60 60 1000)}})
+   :clock/now 0})
 
 (r/defproc request-password-reset
-  {[:request-password-reset {:email #(-> % ::users vals (map :email) set)}]
-   (fn [{:keys [:email ::users ::reset-tokens ::config] :as db}]
-     (when-let [[user-id user] (first (filter (fn [[_ u]] (= email (:email u))) users))]
-       (when (contains? #{:active :locked} (:status user))
-         (let [token-id (keyword (str "t-" (inc (count reset-tokens))))]
-           (-> db
-               (update-in [::users user-id :pending-reset-tokens] conj token-id)
-               (assoc-in [::reset-tokens token-id]
-                         {:user-id user-id
-                          :status :pending
-                          :expires-at (+ (System/currentTimeMillis)
-                                         (:reset-token-expiry-ms config))})
-               (update :mail/outbox conj {:to (:email user)
-                                          :template :password-reset
-                                          :token-id token-id}))))))})
-
-(rh/definvariant reset-only-for-known-users
-  [{:keys [::reset-tokens ::users]}]
-  (every? (fn [[_ {:keys [user-id]}]]
-            (contains? users user-id))
-          reset-tokens))
+  (fn [{:keys [:auth/request-password-reset ::users ::reset-tokens ::config :clock/now] :as db}]
+    (when-let [{:keys [email]} (first request-password-reset)]
+      (when-let [[user-id user] (first (filter (fn [[_ u]] (= email (:email u))) users))]
+        (when (contains? #{:active :locked} (:status user))
+          (let [token-id (keyword (str "token-" (inc (count reset-tokens))))
+                db' (-> db
+                        (update :auth/request-password-reset disj {:email email})
+                        (update ::reset-tokens
+                                (fn [tokens]
+                                  (into {}
+                                        (map (fn [[tid token]]
+                                               [tid (if (and (= user-id (:user-id token))
+                                                             (= :pending (:status token)))
+                                                      (assoc token :status :expired)
+                                                      token)]))
+                                        tokens)))
+                        (assoc-in [::reset-tokens token-id]
+                                  {:user-id user-id
+                                   :created-at now
+                                   :expires-at (+ now (:reset-token-expiry-ms config))
+                                   :status :pending}))]
+            (update db' :mail/outbox conj
+                    {:to (:email user)
+                     :template :password-reset
+                     :data {:token-id token-id}})))))))
 ```
 
 This model captures observable behaviour without encoding database or transport details.
@@ -108,47 +112,52 @@ The same syntax works for operational policy and reliability controls:
 
 ```clojure
 (ns model.circuit-breaker
-  (:require [recife.core :as r]
-            [recife.helpers :as rh]))
+  (:require [recife.core :as r]))
 
 (def global
-  {::circuit {:status :closed
-              :opened-at nil
-              :recent-failures 0}
-   ::config {:failure-threshold 10
+  {::circuit-breaker {:service :external-service
+                      :status :closed
+                      :opened-at nil
+                      :failures []}
+   ::config {:failure-threshold 0.5
+             :failure-window-ms 30000
+             :window-sample-size 20
              :recovery-timeout-ms 10000}
    :clock/now 0})
 
-(r/defproc register-failure
-  (fn [{:keys [::circuit ::config] :as db}]
-    (let [failures (inc (:recent-failures circuit))]
-      (if (>= failures (:failure-threshold config))
-        (-> db
-            (assoc-in [::circuit :recent-failures] failures)
-            (assoc-in [::circuit :status] :open)
-            (assoc-in [::circuit :opened-at] (:clock/now db)))
-        (assoc-in db [::circuit :recent-failures] failures)))))
+(defn recent-failures [db]
+  (let [cutoff (- (:clock/now db) (get-in db [::config :failure-window-ms]))]
+    (filter #(> (:occurred-at %) cutoff)
+            (get-in db [::circuit-breaker :failures]))))
 
-(r/defproc probe-circuit
-  (fn [{:keys [::circuit ::config :clock/now] :as db}]
-    (when (and (= :open (:status circuit))
-               (<= (+ (:opened-at circuit)
+(defn failure-rate [db]
+  (/ (count (recent-failures db))
+     (double (get-in db [::config :window-sample-size]))))
+
+(defn tripped? [db]
+  (>= (failure-rate db) (get-in db [::config :failure-threshold])))
+(r/defproc circuit-opens
+  (fn [{:keys [::circuit-breaker :clock/now] :as db}]
+    (when (and (tripped? db)
+               (= :closed (:status circuit-breaker)))
+      (-> db
+          (assoc-in [::circuit-breaker :status] :open)
+          (assoc-in [::circuit-breaker :opened-at] now)))))
+(r/defproc circuit-probes
+  (fn [{:keys [::circuit-breaker ::config :clock/now] :as db}]
+    (when (and (= :open (:status circuit-breaker))
+               (<= (+ (:opened-at circuit-breaker)
                       (:recovery-timeout-ms config))
                    now))
-      (assoc-in db [::circuit :status] :half-open))))
-
-(rh/definvariant valid-circuit-status
-  [{:keys [::circuit]}]
-  (contains? #{:closed :open :half-open} (:status circuit)))
+      (assoc-in db [::circuit-breaker :status] :half-open))))
 ```
 
 ```clojure
 (ns model.incident-escalation
-  (:require [recife.core :as r]
-            [recife.helpers :as rh]))
+  (:require [recife.core :as r]))
 
 (def global
-  {::incident {:status :investigating
+  {::incident {:status :open
                :declared-at 0
                :sla-target-ms 300000
                :escalation-level 0}
@@ -157,6 +166,8 @@ The same syntax works for operational policy and reliability controls:
    :pager/requests []
    :exec/briefings []})
 
+(defn escalation-policy-at-level [_level]
+  :oncall-team)
 (r/defproc escalate-incident
   (fn [{:keys [::incident ::config :clock/now] :as db}]
     (when (and (contains? #{:open :investigating} (:status incident))
@@ -164,15 +175,11 @@ The same syntax works for operational policy and reliability controls:
       (let [level (inc (:escalation-level incident))]
         (cond-> (-> db
                     (assoc-in [::incident :escalation-level] level)
-                    (update :pager/requests conj {:level level :priority :immediate}))
+                    (update :pager/requests conj
+                            {:team (escalation-policy-at-level level)
+                             :priority :immediate}))
           (>= level (:exec-notify-threshold config))
           (update :exec/briefings conj {:incident :primary :level level}))))))
-
-(rh/defproperty escalation-eventually-stabilizes
-  [{:keys [::incident]}]
-  (rh/eventually
-   (rh/always
-    (<= (:escalation-level incident) 5))))
 ```
 
 The [language reference](references/language-reference.md) covers processes, non-determinism, invariants, temporal properties, fairness and model composition.
