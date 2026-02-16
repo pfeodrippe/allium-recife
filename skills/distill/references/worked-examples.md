@@ -211,6 +211,7 @@ def cleanup_expired_tokens():
 
 (defn hash-password [raw]
   (str "hash:" raw))
+
 (r/defproc request-password-reset
   (fn [{:keys [:auth/request-password-reset ::users ::reset-tokens ::config :clock/now] :as db}]
     (when-let [{:keys [email]} (first request-password-reset)]
@@ -237,6 +238,7 @@ def cleanup_expired_tokens():
                     {:to (:email user)
                      :template :password-reset
                      :data {:token-id token-id}})))))))
+
 (r/defproc complete-password-reset
   (fn [{:keys [:auth/complete-password-reset ::reset-tokens ::users ::sessions ::config :clock/now] :as db}]
     (when-let [{:keys [token-id new-password]} (first complete-password-reset)]
@@ -265,6 +267,7 @@ def cleanup_expired_tokens():
             (update db' :mail/outbox conj
                     {:to (:email user)
                      :template :password-changed})))))))
+
 (r/defproc reset-token-expires
   (fn [{:keys [::reset-tokens :clock/now] :as db}]
     (reduce-kv (fn [acc token-id token]
@@ -603,6 +606,7 @@ export async function changePlan(req: Request, res: Response) {
         limit (:max-projects plan)]
     (or (has-unlimited? limit)
         (< (workspace-project-count db (:id workspace)) limit))))
+
 (r/defproc create-project
   (fn [{:keys [:workspace/create-project ::workspaces ::workspace-memberships] :as db}]
     (when-let [{:keys [user-id workspace-id name]} (first create-project)]
@@ -619,6 +623,7 @@ export async function changePlan(req: Request, res: Response) {
                            :deleted-at nil})
                 (update ::usage-events conj {:workspace-id workspace-id
                                              :type :project-created}))))))))
+
 (r/defproc create-project-limit-reached
   (fn [{:keys [:workspace/create-project ::workspaces ::workspace-memberships] :as db}]
     (when-let [{:keys [user-id workspace-id name] :as cmd} (first create-project)]
@@ -635,6 +640,7 @@ export async function changePlan(req: Request, res: Response) {
                               :current (workspace-project-count db workspace-id)
                               :max (:max-projects plan)
                               :name name}})))))))
+
 (r/defproc change-plan
   (fn [{:keys [:workspace/change-plan ::workspaces ::plans] :as db}]
     (when-let [{:keys [user-id workspace-id new-plan-id] :as cmd} (first change-plan)]
@@ -663,6 +669,7 @@ export async function changePlan(req: Request, res: Response) {
                       {:to (:owner-email workspace)
                        :template (if is-downgrade :plan-downgraded :plan-upgraded)
                        :data {:old-plan old-plan :new-plan new-plan}})))))))
+
 (r/defproc downgrade-blocked
   (fn [{:keys [:workspace/change-plan ::workspaces ::plans] :as db}]
     (when-let [{:keys [user-id workspace-id new-plan-id] :as cmd} (first change-plan)]
@@ -925,6 +932,7 @@ public class RetentionCleanupJob {
 
 (defn membership-can-admin? [db workspace-id user-id]
   (true? (get-in db [::workspace-memberships [workspace-id user-id] :can-admin])))
+
 (r/defproc delete-document
   (fn [{:keys [:document/delete ::documents] :as db}]
     (when-let [{:keys [actor-id document-id] :as cmd} (first delete)]
@@ -938,6 +946,7 @@ public class RetentionCleanupJob {
               (assoc-in [::documents document-id :status] :deleted)
               (assoc-in [::documents document-id :deleted-at] (:clock/now db))
               (assoc-in [::documents document-id :deleted-by] actor-id)))))))
+
 (r/defproc restore-document
   (fn [{:keys [:document/restore ::documents] :as db}]
     (when-let [{:keys [actor-id document-id] :as cmd} (first restore)]
@@ -951,6 +960,7 @@ public class RetentionCleanupJob {
               (assoc-in [::documents document-id :status] :active)
               (assoc-in [::documents document-id :deleted-at] nil)
               (assoc-in [::documents document-id :deleted-by] nil)))))))
+
 (r/defproc permanently-delete
   (fn [{:keys [:document/permanently-delete ::documents] :as db}]
     (when-let [{:keys [actor-id document-id] :as cmd} (first permanently-delete)]
@@ -961,6 +971,7 @@ public class RetentionCleanupJob {
           (-> db
               (update :document/permanently-delete disj cmd)
               (update ::documents dissoc document-id)))))))
+
 (r/defproc empty-trash
   (fn [{:keys [:workspace/empty-trash ::documents] :as db}]
     (when-let [{:keys [actor-id workspace-id] :as cmd} (first empty-trash)]
@@ -974,6 +985,7 @@ public class RetentionCleanupJob {
                                       (and (= workspace-id (:workspace-id doc))
                                            (= :deleted (:status doc)))))
                             docs))))))))
+
 (r/defproc retention-expires
   (fn [{:keys [::documents :clock/now] :as db}]
     (reduce-kv (fn [acc document-id document]

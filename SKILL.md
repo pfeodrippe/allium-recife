@@ -40,10 +40,27 @@ In Recife, domain entities are usually modelled as maps in global state.
 ```clojure
 (def global
   {::candidacies
-   {:c-1 {:candidate-id :cand-1
+   {:cand-1 {:candidate-id :candidate-1
           :role-id :role-1
           :status :pending
-          :retry-count 0}}})
+          :retry-count 0
+          :invitation-id :inv-1
+          :slot-ids #{:slot-1 :slot-2 :slot-3}}}
+   ::invitations
+   {:inv-1 {:candidacy-id :cand-1
+            :expires-at 1739786400000}}
+   ::interview-slots
+   {:slot-1 {:candidacy-id :cand-1 :status :confirmed}
+    :slot-2 {:candidacy-id :cand-1 :status :pending}
+    :slot-3 {:candidacy-id :cand-1 :status :confirmed}}})
+
+(defn confirmed-slots [db candidacy-id]
+  (->> (get-in db [::candidacies candidacy-id :slot-ids])
+       (filter #(= :confirmed (get-in db [::interview-slots % :status])))
+       set))
+
+(defn candidacy-ready? [db candidacy-id]
+  (>= (count (confirmed-slots db candidacy-id)) 3))
 ```
 
 ### External entity
@@ -52,8 +69,13 @@ External systems are represented as namespaced keys and process boundaries.
 
 ```clojure
 (def global
-  {:oauth/requests #{}
-   :oauth/responses #{}})
+  {::roles {:role-1 {:title "Senior Engineer"
+                     :required-skills #{:clojure :distributed-systems}
+                     :location {:name "Remote" :timezone "UTC"}}}
+   :oauth/requests #{}
+   :oauth/responses #{}
+   :calendar/requests #{}
+   :calendar/responses #{}})
 ```
 
 ### Value type
@@ -72,8 +94,13 @@ Value types are plain immutable Clojure values.
 Use tagged maps (`:kind` / `:type`) for variants.
 
 ```clojure
-(def leaf {:kind :leaf :path "/tmp/a" :data [1 2 3]})
-(def branch {:kind :branch :path "/tmp" :children [leaf]})
+(def node-branch {:path "/" :kind :Branch :children [:node-1 :node-2]})
+(def node-leaf {:path "/tmp/a" :kind :Leaf :data [1 2 3] :log [7 8]})
+
+(defn process-node [node]
+  (case (:kind node)
+    :Branch {:children (:children node)}
+    :Leaf {:combined (concat (:data node) (:log node))}))
 ```
 
 Use `case`, `cond`, or predicate guards in processes/invariants to narrow variants.
@@ -97,11 +124,21 @@ Rules are process steps (`r/defproc`) that transition state.
   (:require [recife.core :as r]))
 
 (r/defproc invitation-expires
-  (fn [{:keys [::invitations] :as db}]
-    (when-let [[id invitation] (first invitations)]
-      (when (and (= :pending (:status invitation))
-                 (<= (:expires-at invitation) (:now db)))
-        (assoc-in db [::invitations id :status] :expired)))))
+  (fn [{:keys [::invitations ::interview-slots :clock/now] :as db}]
+    (reduce-kv (fn [acc invitation-id invitation]
+                 (let [remaining-slot-ids (filter #(not= :cancelled
+                                                        (get-in acc [::interview-slots % :status]))
+                                                  (:proposed-slot-ids invitation))]
+                   (if (and (= :pending (:status invitation))
+                            (<= (:expires-at invitation) now))
+                     (let [acc' (assoc-in acc [::invitations invitation-id :status] :expired)]
+                       (reduce (fn [x sid]
+                                 (assoc-in x [::interview-slots sid :status] :cancelled))
+                               acc'
+                               remaining-slot-ids))
+                     acc)))
+               db
+               invitations)))
 ```
 
 ### Trigger types
@@ -120,13 +157,16 @@ Use regular Clojure iteration in process bodies.
 
 ```clojure
 (r/defproc process-digests
-  (fn [{:keys [::users] :as db}]
-    (reduce (fn [acc [user-id user]]
-              (if (get-in user [:notification :digest-enabled?])
-                (update acc :digest/batches conj {:user-id user-id})
-                acc))
-            db
-            users)))
+  (fn [{:keys [::digest-schedule ::users :clock/now] :as db}]
+    (if (<= (:next-run-at digest-schedule) now)
+      (reduce (fn [acc [user-id user]]
+                (if (get-in user [:notification-setting :digest-enabled])
+                  (update acc :digest/batches conj {:user-id user-id
+                                                    :created-at now})
+                  acc))
+              db
+              users)
+      db)))
 ```
 
 ### Ensures patterns
@@ -144,10 +184,23 @@ Boundary contracts are modelled explicitly as operations and visibility rules in
 
 ```clojure
 (def global
-  {::assignments {:a-1 {:slot :s-1 :status :pending :interviewer :i-1}}
-   :ui/interviewer-dashboard {:viewer :i-1
-                              :visible-fields #{:slot :status}
-                              :allowed-actions #{:confirm-slot}}})
+  {::slot-confirmations
+   {:sc-1 {:interviewer-id :i-1
+           :slot {:id :s-1 :time 1739786400000}
+           :status :pending
+           :interview-id :int-1}}
+   :surfaces/interviewer-dashboard
+   {:facing {:viewer-id :i-1}
+    :context {:assignment-id :sc-1}
+    :exposes #{:slot.time :status}
+    :provides [{:op :InterviewerConfirmsSlot
+                :args [:i-1 :s-1]
+                :when (fn [db]
+                        (= :pending (get-in db [::slot-confirmations :sc-1 :status])))}]
+    :related [{:surface :InterviewDetail
+               :args [:int-1]
+               :when (fn [db]
+                       (some? (get-in db [::slot-confirmations :sc-1 :interview-id])))}]}})
 ```
 
 ### Surface-to-implementation contract
@@ -164,13 +217,15 @@ Split models into namespaces and require them from composition namespaces.
 
 ```clojure
 (ns app.model
-  (:require [app.model.oauth :as oauth]
-            [app.model.scheduling :as scheduling]
-            [recife.core :as r]))
+  (:require [recife.core :as r]))
 
-(def components
-  #{oauth/oauth-server
-    scheduling/interview-flow})
+(def dependencies
+  {:oauth {:source "github.com/recife-models/google-oauth/abc123def"}
+   :candidacy {:source "./candidacy.clj"}})
+
+(def qualified-refs
+  {:session [:oauth/session]
+   :candidacy [:candidacy/candidacy]})
 ```
 
 Local references use relative Clojure namespaces/files, e.g. `app/model/scheduling.clj`.
