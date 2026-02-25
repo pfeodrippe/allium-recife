@@ -1,308 +1,245 @@
-# Allium
+# P
 
-*Velocity through clarity*
+*Velocity through executable clarity*
 
 ---
 
-A language for sharpening intent alongside implementation. [juxt.github.io/allium](https://juxt.github.io/allium/)
+A skill pack for modeling, checking, and evolving distributed system behavior with [P](https://p-org.github.io/P/).
+
+P is a state-machine language for event-driven systems. It lets you model components as communicating machines, define safety and liveness properties as monitors, and check behavior under many schedules with `p check`.
 
 ## Get started
 
-**Claude Code** (via the JUXT plugin marketplace):
+**Claude Code** (plugin marketplace):
 
-```
+```text
 /plugin marketplace add juxt/claude-plugins
-/plugin install allium
+/plugin install p
 ```
 
-**Cursor, Windsurf, Copilot, Aider, Continue and 40+ other tools:**
+**Cursor, Windsurf, Copilot, Aider, Continue and other skills-compatible tools:**
 
+```text
+npx skills add juxt/p
 ```
-npx skills add juxt/allium
+
+Once installed, run `/p` for general support.
+
+- `/p:elicit` builds a model from stakeholder conversations.
+- `/p:distill` extracts a model from existing code.
+
+## Install P CLI
+
+This repository also assumes the upstream `p` compiler/checker CLI is available.
+
+Requirements:
+
+- .NET SDK 8.x
+- Java runtime 11+
+
+Install:
+
+```bash
+dotnet tool install --global P
 ```
 
-Once installed, type `/allium` to get started. Allium examines your project and offers to distill from existing code or build a new spec through conversation. You can also jump straight to a specific mode:
+Update (if already installed):
 
-- `/allium:elicit` — build a spec through structured conversation with stakeholders
-- `/allium:distill` — extract a spec from existing code
+```bash
+dotnet tool update --global P
+```
 
-Jump to what [Allium looks like in practice](#what-this-looks-like-in-practice).
+Verify:
+
+```bash
+p --help
+```
+
+Official install/usage docs:
+
+- https://p-org.github.io/P/getstarted/install/
+- https://p-org.github.io/P/getstarted/usingP/
 
 ## Working with agents
 
-A [rule](.claude/rules/allium.md) loads automatically whenever Claude Code works with `.allium` files. It provides syntax guidance, naming conventions and common pitfalls without needing to invoke the skill. This keeps routine spec reads and edits fast.
+A rule at [.claude/rules/p.md](.claude/rules/p.md) auto-loads for `.p` files and keeps syntax and checker semantics in view.
 
-Two specialised agents handle `.allium` files in a delegated context. They load the language reference into their own conversation, keeping Allium syntax out of your main session and freeing you to work on implementation in parallel.
+Two specialized agents support delegated workflows:
 
-**[tend](.claude/agents/tend.md)** grows and shapes specifications. It translates new requirements into well-formed specs, challenges vague requests and won't let ambiguity through. It works on `.allium` files only.
+- **[tend](.claude/agents/tend.md)** grows and refactors P models (`.p`, `.pproj`) from requirement changes.
+- **[weed](.claude/agents/weed.md)** compares P models and implementation code, reports drift, and can update either side.
 
-```
-"Tend: we need a cancellation policy for subscriptions
- with a cooling-off period and prorated refunds"
-
-"Tend: add a circuit breaker entity to the infrastructure spec"
-
-"Tend: restructure the authentication spec, the rules have grown unwieldy"
-```
-
-**[weed](.claude/agents/weed.md)** finds where specifications and implementation have diverged. It reports mismatches and can update either side to match.
-
-```
-"Weed the auth spec against src/auth/"
-
-"Weed: update the spec to match what the payment code actually does"
-
-"Weed: the order spec says cancelled orders can't be refunded
- but the code allows it. Fix the code."
-```
-
-Use `/allium` for interactive spec work, `elicit` to build specs through conversation, `distill` to extract specs from code, `tend` to grow specs as requirements evolve, `weed` to catch drift between spec and code.
+Use `/p` for direct language help, `elicit` for requirement capture, `distill` for code-to-model extraction, `tend` for model evolution, and `weed` for drift detection.
 
 ## The problem with conversational context
 
-- Within a session, meaning drifts: by prompt ten or twenty, the model is pattern-matching on its own outputs rather than the original intent.
-- Across sessions, knowledge evaporates: assumptions and constraints disappear when the chat ends.
+- In long chats, assumptions drift and implicit constraints get blurred.
+- Across sessions, critical behavioral intent is easy to lose.
 
-Allium gives behavioural intent a durable form that doesn't drift with the conversation and persists across sessions.
+P gives intent a durable executable form. You do not rely on memory or prompt archaeology to preserve correctness conditions.
 
 ## Why not just point the LLM at the code?
 
-Modern LLMs navigate codebases effectively, and many engineers find this sufficient. The limitation appears when you need to distinguish what the code *does* from what it *should do*. Code captures implementation, including bugs and expedient decisions. The model treats all of it as intended behaviour.
+Code tells you what currently exists, including accidental behavior and historical workarounds.
 
-Precise prompting helps, but precise prompting means specifying intent: which behaviours are deliberate, which constraints must be preserved. You end up writing descriptions of intent distributed across your prompts. Allium captures this in a form that persists. The next engineer, or the next model, or you next week, can understand not just what the system does but what it was meant to do.
+P models force a separate, explicit statement of intended protocol behavior and system properties. When model and code disagree, that disagreement is useful signal.
 
 ## Why not capture requirements in markdown?
 
-Markdown provides no framework for surfacing ambiguities and contradictions. You can write "users must be authenticated" in one section and "guest checkout is supported" in another without the format highlighting the tension. Capable models may resolve such ambiguities silently in ways you didn't intend; weaker models may not recognise that alternatives existed.
+Markdown can describe behavior, but it does not execute, type-check, or explore interleavings.
 
-Allium's structure makes contradictions visible. When two rules have incompatible preconditions, the formal syntax exposes the conflict. The model doesn't need to be clever enough to spot the issue in prose; the structure does that work. Markdown can capture robust behaviour with sufficient diligence, but that diligence falls entirely on the author. Allium's constraints guide you toward completeness and consistency.
+P adds structure that tools can validate:
+
+- typed events and payloads
+- explicit state transitions
+- executable safety and liveness monitors
+- systematic schedule exploration
 
 ## Iterating on specifications
 
-The specification and the code evolve together. Writing and refining a behavioural model alongside implementation sharpens your understanding of both the problem and your solution. Questions surface that you wouldn't have thought to ask; constraints emerge that only become visible when you try to formalise them.
+P works best as a companion artifact, not a one-off document.
 
-Manual coding embedded this discovery in the act of implementation. LLMs generate code from descriptions, shifting where design thinking occurs. Allium captures it explicitly: the specification becomes the site of that thinking, the code its expression.
+- **Elicitation** captures intended behavior before or during implementation.
+- **Distillation** captures actual behavior from code and runtime logic.
 
-Two processes feed this growth: **elicitation** works forward from intent through structured conversations with stakeholders, while **distillation** works backward from implementation to capture what the system actually does, including behaviours that were never explicitly decided. Distillation reveals what you built; elicitation clarifies what you meant. When these diverge, you've found something worth investigating.
-
-See the [elicitation guide](skills/elicit/SKILL.md) and the [distillation guide](skills/distill/SKILL.md) for detailed approaches.
+The two meet in review: if they differ, decide which side changes.
 
 ## On single sources of truth
 
-A common objection is that maintaining behavioural models alongside code violates the single source of truth principle. But code captures both intentional and accidental behaviour, with no mechanism to distinguish them. Is that authentication quirk a feature or a bug? The code can't tell you. You need something outside the code to even articulate "this behaviour is wrong". Engineers already accept this in other contexts: type systems express intent that code must satisfy, tests assert expected behaviour against actual behaviour. These aren't duplication.
+Code and model are different truths about different concerns:
 
-Allium applies the same pattern. Code excels at expressing *how*; behavioural models excel at expressing *what* and *under which conditions*. When these disagree, that disagreement is information. Perhaps the implementation drifted from intent, or perhaps the model was naive. Either might need to change. The gap between them surfaces questions you need to answer. Redundancy, in this context, isn't overhead. It's resilience.
+- code: implementation mechanics
+- model: intended distributed behavior and properties
 
-## What Allium captures
+Maintaining both is similar to maintaining tests and types. It is deliberate redundancy that catches drift earlier.
 
-Allium provides a minimal syntax for describing events with their preconditions and the outcomes that result. The language deliberately excludes implementation details such as database schemas and API designs, focusing purely on observable behaviour.
+## What P captures
 
-```allium
-rule RequestPasswordReset {
-    when: UserRequestsPasswordReset(email)
+P captures distributed behavior in terms of events, state machines, modules, tests, and monitors.
 
-    let user = User{email}
+```p
+type tTransfer = (id: int, from: int, to: int, amount: int, client: machine);
+type tTransferResult = (id: int, ok: bool);
 
-    requires: exists user
-    requires: user.status in {active, locked}
+event eTransferReq: tTransfer;
+event eTransferResp: tTransferResult;
 
-    ensures:
-        for t in user.pending_reset_tokens:
-            t.status = expired
-    ensures:
-        let token = PasswordResetToken.created(
-            user: user,
-            created_at: now,
-            expires_at: now + config.reset_token_expiry,
-            status: pending
-        )
-        Email.created(
-            to: user.email,
-            template: password_reset,
-            data: { token: token }
-        )
+event eLedgerApplied: (id: int, fromBalance: int, toBalance: int);
+
+machine Ledger {
+  var balance: map[int, int];
+
+  start state Ready {
+    on eTransferReq do (req: tTransfer) {
+      if (balance[req.from] >= req.amount) {
+        balance[req.from] = balance[req.from] - req.amount;
+        balance[req.to] = balance[req.to] + req.amount;
+        send req.client, eTransferResp, (id = req.id, ok = true);
+        announce eLedgerApplied, (id = req.id, fromBalance = balance[req.from], toBalance = balance[req.to]);
+      } else {
+        send req.client, eTransferResp, (id = req.id, ok = false);
+      }
+    }
+  }
+}
+
+spec NonNegativeBalances observes eLedgerApplied {
+  start state S {
+    on eLedgerApplied do (x: (id: int, fromBalance: int, toBalance: int)) {
+      assert x.fromBalance >= 0 && x.toBalance >= 0,
+        "negative balance observed";
+    }
+  }
 }
 ```
 
-This rule captures observable behaviour: when a password reset is requested, if the email matches an active or locked account, existing tokens are invalidated, a new token is created and an email is sent. It says nothing about which database stores the token or which service sends the email, because those decisions belong to implementation.
+### A language with a checker
 
-The same syntax works whether you're capturing infrastructure contracts or operational policy. A circuit breaker specification describes behaviour that typically lives in library defaults, Grafana alerts and architecture docs, never in any formal specification:
+P has a compiler and a checker.
 
-```allium
-entity CircuitBreaker {
-    service: ExternalService
-    status: closed | open | half_open
-    opened_at: Timestamp?
-    failures: Failure with circuit_breaker = this
-    recent_failures: failures with occurred_at > now - config.failure_window
-    failure_rate: recent_failures.count / config.window_sample_size
-    is_tripped: failure_rate >= config.failure_threshold
-}
+- `p compile` builds a model executable from your `.p` files.
+- `p check` explores schedules, checks assertions, deadlocks, unhandled events, and monitor properties.
 
-config {
-    failure_threshold: Decimal = 0.5
-    failure_window: Duration = 30.seconds
-    window_sample_size: Integer = 20
-    recovery_timeout: Duration = 10.seconds
-}
-
-rule CircuitOpens {
-    when: circuit_breaker: CircuitBreaker.is_tripped
-    requires: circuit_breaker.status = closed
-
-    ensures:
-        circuit_breaker.status = open
-        circuit_breaker.opened_at = now
-}
-
-rule CircuitProbes {
-    when: circuit_breaker: CircuitBreaker.opened_at + config.recovery_timeout <= now
-    requires: circuit_breaker.status = open
-
-    ensures: circuit_breaker.status = half_open
-}
-```
-
-At the other end, an incident escalation rule captures operational policy that otherwise lives in runbooks, PagerDuty config and tribal knowledge, where drift between intent and implementation causes real damage:
-
-```allium
-config {
-    exec_notify_threshold: Integer = 2
-}
-
-deferred EscalationPolicy.at_level
-
-rule IncidentEscalates {
-    when: incident: Incident.declared_at + incident.sla_target <= now
-    requires: incident.status in {open, investigating}
-
-    ensures:
-        incident.escalation_level = incident.escalation_level + 1
-        OnCallPaged(
-            team: EscalationPolicy.at_level(incident.escalation_level),
-            priority: immediate
-        )
-        if incident.escalation_level >= config.exec_notify_threshold:
-            ExecBriefingSent(incident: incident)
-}
-```
-
-The [language reference](references/language-reference.md) covers entities, rules, triggers, relationships, projections, derived values, surfaces and actor declarations.
-
-### A language without a runtime
-
-Allium has no compiler and no runtime. It is purely descriptive, defined entirely by its documentation.
-
-In an era where LLMs function as pseudocode compilers, executing informal descriptions into working code, a well-structured behavioural language becomes the mechanism for ensuring that what gets compiled is what you actually meant. The behavioural model is the primary artefact; the code that implements it is secondary.
+This turns "does this seem right?" into a concrete verification workflow.
 
 ## What this looks like in practice
 
-### Allium surfaces implications you missed
+### P surfaces implications you missed
 
-A customer's account was suspended for a terms of service violation. They've appealed and the team wants to let them back in.
+You ask for retries on timeout.
 
----
-
-> ***> A customer says they can't reset their password. Their account was suspended last month but they've appealed and we want to let them back in. Can you enable password reset for suspended users?***
->
-> ✻ Your Allium requires `user.status in {active, locked}` for password resets. This user's status is `suspended`, so the reset is blocked by design. Reactivating through password reset would bypass your `AccountReinstated` rule, which requires admin approval and logs an audit trail.
->
-> ✻ Should we reinstate the account through the existing admin flow first, then let them reset their password? Or create a new `AccountReinstatedViaAppeal` rule that combines both steps with the audit trail intact?
->
-> ***> Reinstate through the admin flow first. The audit trail matters.***
-
----
-
-Without Allium, the LLM would have relaxed the status check, accidentally creating a backdoor around an admin control. The behavioural model caught that password reset and account reinstatement are separate concerns with different approval requirements.
+The model reveals retries can duplicate side effects unless idempotency by request ID is enforced. You add dedup tracking before changing code.
 
 ### Knowledge persists across sessions
 
-A developer starts a new session days later, working on a different feature.
+Days later, someone adds a new request path.
 
----
+The checker fails a liveness monitor because one path never emits response events. The issue is caught before rollout.
 
-> ***> Add a free trial. New subscribers get their first month at no charge.***
->
-> ✻ Your Allium has a constraint here. `SubscriptionCreated` ensures a payment is processed and `InvoiceGenerated` requires `invoice.amount > 0`. A free first month would need to bypass both.
->
-> ✻ Should the trial skip invoice generation entirely, or create a zero-value invoice for the audit trail? And should the `PaymentMethod` still be captured upfront, or only when the trial converts?
->
-> ***> Create a zero-value invoice and capture the payment method upfront.***
+### P grounds a design conversation
 
----
+A proposal merges two states for simplicity.
 
-The developer never mentioned invoicing or payment method capture. The Allium did, from a session that ended days ago. Without it, the LLM would have implemented the trial with no awareness of these constraints, and the gaps would have surfaced in production.
-
-### Allium grounds a design conversation
-
-A developer asks for a straightforward feature.
-
----
-
-> ***> Add an endpoint so admins can view any user's payment history.***
->
-> ✻ Your Allium doesn't give admins blanket access. `AdminAction` requires the admin's scope to include the target resource. The current scopes are `billing`, `users` and `support`. Should this endpoint require `billing` scope?
->
-> ***> Yes, billing scope. But our support team needs to see payment history too, for resolving disputes. What are our options?***
->
-> ✻ You could add `billing` to the support role, but that also grants access to refunds and plan changes, which your Allium controls through the same scope.
->
-> ✻ Alternatively, split `billing` into `billing.read` and `billing.write`. Support gets read-only access, finance gets both. Your code in `admin/permissions.py` already distinguishes read and write operations but maps them both to the same scope check, so the implementation is halfway there.
->
-> ***> Go with the read/write split. Update the Allium first, then refactor the scope checks to match.***
-
----
-
-Without Allium, the LLM would likely have implemented a simple `is_admin` check. Instead, the conversation surfaced a scoping model, explored its implications for a second team, and arrived at a design that aligns the behavioural model with a distinction the code already made but never formalised.
+The monitor suite now cannot distinguish "accepted but not durable" from "durably applied." You keep the intermediate state because that distinction matters for correctness.
 
 ### Distillation catches drift
 
-A developer asks the LLM to check whether the code still matches the Allium.
+A model says retries stop after three attempts.
 
----
+Code now retries indefinitely under one branch. `weed` reports the divergence, and you choose whether to update model or code.
 
-> ***> Can you check whether our authentication code matches the Allium?***
->
-> ✻ I found a divergence. Your Allium says `LoginFailure` checks `user.failed_login_attempts >= config.max_login_attempts`, configured as 5. But `auth/login.py` line 47 hardcodes the limit at 3 and doesn't reset the counter after a successful login. The Allium says `LoginSuccess` ensures `user.failed_login_attempts = 0`.
->
-> ✻ Either the code drifted or the Allium is aspirational. Which should we trust?
->
-> ***> The Allium is right. Fix the code to match.***
+## Typical workflow
 
----
+1. Model behavior in `.p` files (`PSrc/`, `PSpec/`, `PTst/`).
+2. Compile with `p compile` (prefer a `.pproj` file).
+3. Run `p check -tc <testcase> -s <schedules>`.
+4. Iterate model and implementation until monitors and tests pass.
 
-Code and intent diverge silently over time. Allium gives the LLM something to check against, turning "does this look right?" into a concrete comparison with a definitive answer.
+Example `.pproj`:
+
+```xml
+<Project>
+  <ProjectName>PaymentFlow</ProjectName>
+  <InputFiles>
+    <PFile>./PSrc/</PFile>
+    <PFile>./PSpec/</PFile>
+    <PFile>./PTst/</PFile>
+  </InputFiles>
+  <OutputDir>./PGenerated/</OutputDir>
+</Project>
+```
+
+## Repository structure
+
+- `SKILL.md`: core P modeling guidance
+- `references/language-reference.md`: language and workflow reference for this skill pack
+- `references/patterns.md`: reusable modeling patterns
+- `references/test-generation.md`: checker-oriented test planning
+- `skills/elicit/`: requirements to model workflow
+- `skills/distill/`: code to model workflow
 
 ## Language governance
 
-Every change to Allium is debated by a [nine-member review panel](TEAM.md) before adoption. Each panellist represents a distinct design priority: simplicity, machine reasoning, composability, readability, formal rigour, domain modelling, developer experience, creative ambition and backward compatibility. The panel exists to surface tensions that any single perspective would miss.
-
-The panel operates in two modes. [Reviews](REVIEW.md) evaluate fixes to rough edges in the existing language, where the default is to fix the problem if a good fix exists. [Proposals](PROPOSE.md) evaluate new features and ambitious changes, where the default is to leave the language alone unless the case for change is strong. Both follow the same debate protocol: present, respond, rebut, synthesise, verdict.
+This repository keeps a structured review process in [TEAM.md](TEAM.md), with dedicated prompts in [REVIEW.md](REVIEW.md) and [PROPOSE.md](PROPOSE.md), so language guidance changes remain coherent.
 
 ## Feedback
 
-We'd love to hear how you get on with Allium. Success stories, rough edges, missing features, things that surprised you. Drop us a line at [info@juxt.pro](mailto:info@juxt.pro) or [raise an issue](https://github.com/juxt/allium/issues) if you have a specific request.
+If you want behavior or guidance changes, open an issue or submit a PR with:
+
+- concrete modeling pain point
+- minimal reproducer
+- proposed wording or pattern update
 
 ## About the name
 
-Allium is the botanical family containing onions and shallots. The name continues a tradition in behaviour specification tooling: Cucumber and Gherkin established botanical naming as a convention in behaviour-driven development, followed by tools like Lettuce and Spinach.
-
-The phonetic echo of "LLM" is intentional, reflecting where we expect these models to be most useful.
-
-The idiom "know your onions" means to understand a subject thoroughly. Engineers have always held two models: what the system should do and what it currently does. Code formalised implementation; intent remained scattered across documents, emails and Slack messages. LLMs generate implementations from descriptions, so Allium consolidates that scattered understanding into an explicit form models can reference reliably.
-
-Like its namesake, working with Allium may produce tears during the peeling, but never at the table.
-
----
+`P` is the language name used by the upstream project for formally modeling distributed event-driven systems.
 
 ## Copyright & License
 
-The MIT License (MIT)
+See [LICENSE](LICENSE).
 
-Copyright © 2026 JUXT Ltd.
+## References
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+- P docs: https://p-org.github.io/P/
+- P GitHub repo: https://github.com/p-org/P
+- Tutorials: https://p-org.github.io/P/tutsoutline/

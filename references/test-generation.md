@@ -1,49 +1,142 @@
 # Test generation
 
-From an Allium specification, generate:
+## Checker planning
 
-**Contract tests** (per rule):
-- Success case: all preconditions met, verify all postconditions hold
-- Failure cases: one test per precondition, verify rule is rejected when that precondition fails
-- Edge cases: boundary values for numeric conditions
+From a P model, generate testcases that exercise both protocol behavior and monitor obligations.
 
-**State transition tests** (per entity with status):
-- Valid transitions succeed via their rules
-- Invalid transitions are rejected (no rule allows them)
-- Terminal states have no outbound transitions
+## 1. Contract tests per protocol
 
-**Temporal tests** (per time-based trigger):
-- Before deadline: rule doesn't fire, state unchanged
-- At deadline: rule fires, postconditions hold
-- After deadline: rule has already fired, doesn't re-fire
+For each request/response protocol, generate:
 
-**Communication tests** (per Notification/Email/etc):
-- Verify communication is triggered
-- Verify recipient is correct
-- Verify template and data are passed
+- success path
+- rejection path
+- malformed/out-of-order path
 
-**Scenario tests** (per flow):
-- Happy path through main flow
-- Edge cases and error paths
-- Concurrent scenarios: what happens if two triggers fire simultaneously?
+Template:
 
-**Sum type tests** (per sum type):
-- Type discrimination: verify each variant has distinct accessible fields
-- Exhaustiveness: verify all variants are handled in conditional logic
-- Invalid state prevention: verify that an entity cannot be multiple variants
-- Type guard correctness: verify variant-specific fields are only accessible within appropriate type guards
+```p
+test tcContractNominal [main=ContractDriver]:
+  CheckedSystem;
 
-**Surface tests** (per surface):
-- Exposure tests: verify each item in `exposes` is accessible to the specified party
-- Provides availability tests: verify provided operations appear when their `when` conditions are true
-- Provides unavailability tests: verify provided operations are hidden when `when` conditions are false
-- Requires tests: verify the surface rejects interaction when required contributions are missing
-- Related surface navigation: verify navigation to related surfaces works
-- Party restriction tests: verify the surface is not accessible to other party types
-- Guarantee tests: verify stated guarantees hold across the boundary
+test tcContractRejected [main=RejectedDriver]:
+  CheckedSystem;
+```
 
-**Cross-rule interaction tests** (per rule with entity-creating ensures):
-- Re-trigger sibling rules on the same parent while the created entity exists. Verify guards prevent duplicate creation or conflicting state.
-- For each surface `provides` entry, generate unavailability tests for each conjunct in the corresponding rule's requires. One test per conjunct, each falsifying that conjunct, verifying the operation is hidden or rejected.
+## 2. State transition tests
 
-**Concurrency note:** Rules are assumed to be atomic, meaning a rule either completes entirely or not at all. If two rules could fire simultaneously on the same entity, test that the resulting state is consistent regardless of order.
+For each lifecycle machine:
+
+- valid transitions
+- invalid transition attempts
+- terminal-state behavior
+
+Example target states:
+
+```text
+PENDING -> ACTIVE -> COMPLETED
+PENDING -> CANCELLED
+COMPLETED (terminal)
+```
+
+## 3. Temporal and retry tests
+
+For timeout/retry behavior, include:
+
+- before-timeout path
+- at-timeout path
+- retry-exhaustion path
+
+Template events:
+
+```p
+event eTimeout: (reqId: int);
+event eRetryExhausted: (reqId: int);
+```
+
+## 4. Monitor-driven tests
+
+For each `spec` monitor:
+
+- at least one testcase expected to satisfy the property
+- at least one adversarial testcase that would violate property if guards regress
+
+Monitor template:
+
+```p
+spec EveryRequestResponds observes eReq, eResp {
+  var pending: set[int];
+  start state Idle {
+    on eReq goto Waiting with (r: (reqId: int, client: machine)) {
+      pending += (r.reqId);
+    }
+  }
+  hot state Waiting {
+    on eReq goto Waiting with (r: (reqId: int, client: machine)) {
+      pending += (r.reqId);
+    }
+    on eResp do (x: (reqId: int, ok: bool)) {
+      assert x.reqId in pending, "response without request";
+      pending -= (x.reqId);
+      if (sizeof(pending) == 0) goto Idle;
+    }
+  }
+}
+```
+
+## 5. Parameterized coverage
+
+When behavior depends on scale/config, generate parameterized tests.
+
+```p
+param nClients: int;
+param retryLimit: int;
+
+test param (nClients in [1, 2, 4], retryLimit in [1, 2, 3])
+  assume (nClients * retryLimit <= 8)
+  tcScale [main=ScaleDriver]:
+  CheckedSystem;
+```
+
+## 6. Concurrency and race tests
+
+Create drivers that force risky interleavings:
+
+- duplicate command events
+- response-before-request bugs
+- timeout-vs-success races
+- revoke-vs-authorize races
+
+## 7. Drift-focused regression tests
+
+When drift is found:
+
+- add testcase reproducing current code behavior
+- add testcase reproducing current model behavior
+- decide source of truth, then keep the aligned one
+
+## 8. Checker profile matrix
+
+Use explicit schedule budgets:
+
+1. smoke: `p check -tc <x> -s 1`
+2. local: `p check -tc <x> -s 100`
+3. deep: `p check -tc <x> -s 10000`
+
+## 9. Reporting checklist
+
+Record with each run:
+
+- testcase name
+- schedule count
+- seed/strategy metadata
+- pass/fail outcome
+- failing trace summary
+
+## 10. Minimal acceptance bar
+
+Treat a change as test-ready when:
+
+- touched monitors have at least one exercising testcase
+- at least one adversarial testcase exists for changed behavior
+- at least one run at `-s >= 100` passes
+- no unresolved assertion/deadlock/unhandled-event findings remain

@@ -1,236 +1,251 @@
 ---
-name: allium
-description: An LLM-native language for sharpening intent alongside implementation. Velocity through clarity.
+name: p
+description: Model and verify distributed event-driven systems in P. Velocity through executable clarity.
 version: 1
 auto_trigger:
-  - file_patterns: ["**/*.allium"]
-  - keywords: ["allium", "allium spec", "allium specification", ".allium file"]
+  - file_patterns: ["**/*.p"]
+  - file_patterns: ["**/*.pproj"]
+  - keywords: ["p language", "p model", "p spec", "state machine", "model checking", "p check"]
 ---
 
-# Allium
+# P
 
-Allium is a formal language for capturing software behaviour at the domain level. It sits between informal feature descriptions and implementation, providing a precise way to specify what software does without prescribing how it's built.
-
-The name comes from the botanical family containing onions and shallots, continuing a tradition in behaviour specification tooling established by Cucumber and Gherkin.
-
-Key principles:
-
-- Describes observable behaviour, not implementation
-- Captures domain logic that matters at the behavioural level
-- Generates integration and end-to-end tests (not unit tests)
-- Forces ambiguities into the open before implementation
-- Implementation-agnostic: the same spec could be implemented in any language
-
-Allium does NOT specify programming language or framework choices, database schemas or storage mechanisms, API designs or UI layouts, or internal algorithms (unless they are domain-level concerns).
+P is a state-machine language for modeling asynchronous distributed behavior and validating it with model checking.
 
 ## Routing table
 
 | Task | Skill | When |
 |------|-------|------|
-| Writing or reading `.allium` files | this skill | You need language syntax and structure |
-| Building a spec through conversation | `elicit` | User describes a feature or behaviour they want to build |
-| Extracting a spec from existing code | `distill` | User has implementation code and wants a spec from it |
+| Writing or reading `.p` files | this skill | You need syntax, semantics, and modeling patterns |
+| Building a model through conversation | `elicit` | Requirements are coming from stakeholders |
+| Extracting a model from existing code | `distill` | Implementation exists and behavior must be recovered |
 
 ## Quick syntax summary
 
 ### Entity
 
-```
-entity Candidacy {
-    -- Fields
-    candidate: Candidate
-    role: Role
-    status: pending | active | completed | cancelled   -- inline enum
-    retry_count: Integer
+P has no `entity` keyword. Equivalent domain entities are represented by typed tuples and machine state maps.
 
-    -- Relationships
-    invitation: Invitation with candidacy = this         -- one-to-one
-    slots: InterviewSlot with candidacy = this           -- one-to-many
-
-    -- Projections
-    confirmed_slots: slots where status = confirmed
-    pending_slots: slots where status = pending
-
-    -- Derived
-    is_ready: confirmed_slots.count >= 3
-    has_expired: invitation.expires_at <= now
-}
+```p
+type tOrder = (id: int, status: int, amount: int);
 ```
 
 ### External entity
 
-```
-external entity Role { title: String, required_skills: Set<Skill>, location: Location }
+External systems are modeled as boundary machines/events.
+
+```p
+event eGatewayReq: (reqId: int, amount: int, client: machine);
+event eGatewayResp: (reqId: int, ok: bool);
+
+machine GatewayBoundary {
+  start state Ready {
+    on eGatewayReq do (r: (reqId: int, amount: int, client: machine)) {
+      send r.client, eGatewayResp, (reqId = r.reqId, ok = true);
+    }
+  }
+}
 ```
 
 ### Value type
 
-```
-value TimeRange { start: Timestamp, end: Timestamp, duration: end - start }
+Use type aliases for value-like records.
+
+```p
+type tMoney = (currency: string, cents: int);
 ```
 
 ### Sum type
 
-A base entity declares a discriminator field whose capitalised values name the variants. Variants use the `variant` keyword.
+Use enum-tagged tuples for variant-like modeling.
 
+```p
+enum tNodeKind { BRANCH, LEAF }
+type tNode = (kind: tNodeKind, data: int);
 ```
-entity Node {
-    path: Path
-    kind: Branch | Leaf              -- discriminator field
-}
-
-variant Branch : Node {
-    children: List<Node?>
-}
-
-variant Leaf : Node {
-    data: List<Integer>
-    log: List<Integer>
-}
-```
-
-Lowercase pipe values are enum literals (`status: pending | active`). Capitalised values are variant references (`kind: Branch | Leaf`). Type guards (`requires:` or `if` branches) narrow to a variant and unlock its fields.
 
 ### Module given
 
-Declares the entity instances a module's rules operate on. All rules inherit these bindings. Not every module needs one: rules scoped by triggers on domain entities get their entities from the trigger. `given` is for specs where rules operate on shared instances that exist once per module scope.
+Context is carried via machine `entry` payloads, local variables, and testcase drivers.
 
-```
-given {
-    pipeline: HiringPipeline
-    calendar: InterviewCalendar
+```p
+machine Driver {
+  var service: machine;
+
+  start state Init {
+    entry {
+      service = new Service();
+      new Client(service);
+    }
+  }
 }
 ```
 
-Imported module instances are accessed via qualified names (`scheduling/calendar`) and do not appear in the local `given` block. Distinct from surface `context`, which binds a parametric scope for a boundary contract.
-
 ### Rule
 
-```
-rule InvitationExpires {
-    when: invitation: Invitation.expires_at <= now
-    requires: invitation.status = pending
-    let remaining = invitation.proposed_slots where status != cancelled
-    ensures: invitation.status = expired
-    ensures:
-        for s in remaining:
-            s.status = cancelled
+Rule semantics map to event handlers inside machine states.
+
+```p
+on eReq do (r: tReq) {
+  if (r.ok) { send r.client, eResp, (id = r.id, ok = true); }
 }
 ```
 
 ### Trigger types
 
-- **External stimulus**: `when: CandidateSelectsSlot(invitation, slot)` — action from outside the system
-- **State transition**: `when: interview: Interview.status transitions_to scheduled` — entity changed state (transition only, not creation)
-- **State becomes**: `when: interview: Interview.status becomes scheduled` — entity has this value, whether by creation or transition
-- **Temporal**: `when: invitation: Invitation.expires_at <= now` — time-based condition (always add a `requires` guard against re-firing)
-- **Derived condition**: `when: interview: Interview.all_feedback_in` — derived value becomes true
-- **Entity creation**: `when: batch: DigestBatch.created` — fires when a new entity is created
-- **Chained**: `when: AllConfirmationsResolved(candidacy)` — subscribes to a trigger emission from another rule's ensures clause
+Common trigger classes in P models:
 
-All entity-scoped triggers use explicit `var: Type` binding. Use `_` as a discard binding where the name is not needed: `when: _: Invitation.expires_at <= now`, `when: SomeEvent(_, slot)`.
+- external request event
+- internal completion event
+- timeout/scheduler event
+- monitor-observed announcement
+
+```p
+event eReq: (reqId: int, client: machine);
+event eDone: (reqId: int);
+event eTimeout: (reqId: int);
+event eObserved: (reqId: int);
+```
 
 ### Rule-level iteration
 
-A `for` clause applies the rule body once per element in a collection:
+Use loops and helper functions for collection-wide updates.
 
-```
-rule ProcessDigests {
-    when: schedule: DigestSchedule.next_run_at <= now
-    for user in Users where notification_setting.digest_enabled:
-        let settings = user.notification_setting
-        ensures: DigestBatch.created(user: user, ...)
+```p
+fun ZeroAll(values: seq[int]): seq[int] {
+  var out: seq[int];
+  var i: int;
+  out = values;
+  i = 0;
+  while (i < sizeof(out)) {
+    out[i] = 0;
+    i = i + 1;
+  }
+  return out;
 }
 ```
 
 ### Ensures patterns
 
-Ensures clauses have four outcome forms:
+Postconditions are expressed by:
 
-- **State changes**: `entity.field = value`
-- **Entity creation**: `Entity.created(...)` — the single canonical creation verb
-- **Trigger emission**: `TriggerName(params)` — emits an event for other rules to chain from
-- **Entity removal**: `not exists entity` — asserts the entity no longer exists
+- state mutation
+- emitted `send`/`announce` events
+- monitor-observable outputs
 
-These forms compose with `for` iteration (`for x in collection: ...`), `if`/`else` conditionals and `let` bindings.
-
-Entity creation uses `.created()` exclusively. Domain meaning lives in entity names and rule names, not in creation verbs.
-
-In state change assignments, the right-hand expression references pre-rule field values. Conditions within ensures blocks (`if` guards, creation parameters, trigger emission parameters) reference the resulting state.
+```p
+statusByReq[reqId] = 1;
+send client, eResp, (reqId = reqId, ok = true);
+announce eRequestCompleted, (reqId = reqId);
+```
 
 ### Surface
 
+P has no `surface` keyword; boundary contracts are modeled as event protocols + monitor properties.
+
+```p
+event eApiCreateReq: (reqId: int, actorId: int, value: int, client: machine);
+event eApiCreateResp: (reqId: int, ok: bool, resourceId: int);
 ```
-surface InterviewerDashboard {
-    facing viewer: Interviewer
-
-    context assignment: SlotConfirmation where interviewer = viewer
-
-    exposes:
-        assignment.slot.time
-        assignment.status
-
-    provides:
-        InterviewerConfirmsSlot(viewer, assignment.slot)
-            when assignment.status = pending
-
-    related:
-        InterviewDetail(assignment.slot.interview)
-            when assignment.slot.interview != null
-}
-```
-
-Surfaces define contracts at boundaries. The `facing` clause names the external party, `context` scopes the entity. The remaining clauses use a single vocabulary regardless of whether the boundary is user-facing or code-to-code: `exposes` (visible data, supports `for` iteration over collections), `provides` (available operations with optional when-guards), `guarantee` (constraints that must hold), `guidance` (non-normative advice), `related` (associated surfaces reachable from this one), `timeout` (references to temporal rules that apply within the surface's context).
-
-The `facing` clause accepts either an actor type (with a corresponding `actor` declaration and `identified_by` mapping) or an entity type directly. Use actor declarations when the boundary has specific identity requirements; use entity types when any instance can interact (e.g., `facing visitor: User`). For integration surfaces where the external party is code, declare an actor type with a minimal `identified_by` expression. Actors that reference `within` in their `identified_by` expression must declare the expected context type: `within: Workspace`.
 
 ### Surface-to-implementation contract
 
-The `exposes` block is the field-level contract: the implementation returns exactly these fields, the consumer uses exactly these fields. Do not add fields not listed. Do not omit fields that are listed.
+Event payloads and monitor assertions form the contract between model intent and implementation behavior.
 
-### Expressions
+```p
+spec EveryApiCreateResponds observes eApiCreateReq, eApiCreateResp {
+  var pending: set[int];
 
-Navigation: `interview.candidacy.candidate.email`, `reply_to?.author` (optional), `timezone ?? "UTC"` (null coalescing). Collections: `slots.count`, `slot in invitation.slots`, `interviewers.any(i => i.can_solo)`, `for item in collection: item.status = cancelled`, `permissions + inherited` (set union), `old - new` (set difference). Comparisons: `status = pending`, `count >= 2`, `status in {confirmed, declined}`, `provider not in providers`. Boolean logic: `a and b`, `a or b`, `not a`.
+  start state Idle {
+    on eApiCreateReq goto Waiting with (r: (reqId: int, actorId: int, value: int, client: machine)) {
+      pending += (r.reqId);
+    }
+  }
 
-### Modular specs
-
-```
-use "github.com/allium-specs/google-oauth/abc123def" as oauth
-```
-
-Qualified names reference entities across specs: `oauth/Session`. Coordinates are immutable (git SHAs or content hashes). Local specs use relative paths: `use "./candidacy.allium" as candidacy`.
-
-### Config
-
-```
-config {
-    invitation_expiry: Duration = 7.days
-    max_login_attempts: Integer = 5
+  hot state Waiting {
+    on eApiCreateReq goto Waiting with (r: (reqId: int, actorId: int, value: int, client: machine)) {
+      pending += (r.reqId);
+    }
+    on eApiCreateResp do (x: (reqId: int, ok: bool, resourceId: int)) {
+      assert x.reqId in pending, "response without request";
+      pending -= (x.reqId);
+      if (sizeof(pending) == 0) goto Idle;
+    }
+  }
 }
 ```
 
-Rules reference config values as `config.invitation_expiry`. For default entity instances, use `default`.
+### Expressions
+
+Use standard P expressions for arithmetic, comparisons, boolean logic, and collection operations (`sizeof`, `keys`, `values`, membership).
+
+```p
+assert req.amount > 0 && req.accountId in balanceByAccount, "invalid request";
+if (sizeof(pending) == 0) { goto Idle; }
+```
+
+### Modular specs
+
+Use modules to compose machines and attach monitor assertions.
+
+```p
+module Core = { Client, Server };
+module Checked = assert SafetySpec, LivenessSpec in Core;
+```
+
+### Config
+
+P has no dedicated config block; use `param`, driver initialization, and constants/helpers.
+
+```p
+param retryLimit: int;
+```
 
 ### Defaults
 
-```
-default Role viewer = { name: "viewer", permissions: { "documents.read" } }
+Use `default(T)` for initialization/reset.
+
+```p
+var pending: set[int];
+pending = default(set[int]);
 ```
 
 ### Deferred specs
 
-```
-deferred InterviewerMatching.suggest    -- see: detailed/interviewer-matching.allium
+For deferred behavior, keep placeholders and explicit TODO assumptions near machines/specs.
+
+```p
+// TODO: model compensation flow before enabling eCompensateReq path.
 ```
 
 ### Open questions
 
+Record unresolved behavior explicitly in comments/issues adjacent to the model.
+
+```p
+// Open question: should retryLimit be per-tenant or global?
 ```
-open question "Admin ownership - should admins be assigned to specific roles?"
+
+## Program outline
+
+Recommended layout:
+
+- `PSrc/`: events, datatypes, machines, shared functions
+- `PSpec/`: monitor specs (`spec` machines)
+- `PTst/`: test drivers and testcases
+- `PForeign/`: optional foreign type/function implementations
+- `<name>.pproj`: compiler project definition
+
+## Checker workflow
+
+```bash
+p compile
+p check
+p check -tc tcSingleClient -s 100
 ```
 
 ## References
 
-- [Language reference](./references/language-reference.md) — full syntax for entities, rules, expressions, surfaces and validation
-- [Test generation](./references/test-generation.md) — generating tests from specifications
-- [Patterns](./references/patterns.md) — 8 worked patterns: auth, RBAC, invitations, soft delete, notifications, usage limits, comments, library spec integration
+- [Language reference](./references/language-reference.md)
+- [Patterns](./references/patterns.md)
+- [Test generation](./references/test-generation.md)

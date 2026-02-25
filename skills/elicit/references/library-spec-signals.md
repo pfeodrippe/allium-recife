@@ -1,108 +1,85 @@
-# Recognising library spec opportunities
+# Recognizing library module opportunities
 
-During elicitation, stay alert for descriptions that suggest a library spec rather than application-specific logic. Library specs are standalone specifications for generic integrations that could be reused across projects.
+During elicitation, identify behavior that should live in a reusable P module rather than inline application logic.
 
-This applies equally to distillation. When examining existing code and finding OAuth flows or payment processing, the same questions apply.
+## Signals that something might be a reusable module
 
-## Signals that something might be a library spec
+### External system integration
 
-**External system integration:**
+Examples:
 
-- "We use Google/Microsoft/GitHub for login"
-- "Payments go through Stripe/PayPal"
-- "We send emails via SendGrid/Postmark"
-- "Calendar invites sync with Google Calendar"
-- "We store files in S3/GCS"
+- OAuth / OIDC sign-in flows
+- payment provider workflows
+- webhook processing with retries/signature checks
+- file storage and scanning lifecycle
 
-**Generic patterns being described:**
+### Generic protocol patterns
 
-- OAuth flows, session management, token refresh
-- Payment processing, subscriptions, invoicing
-- Email delivery, bounce handling, unsubscribes
-- File upload, virus scanning, thumbnail generation
-- Webhook receipt, retry logic, signature verification
+Examples:
 
-**Implementation-agnostic descriptions:**
+- request/ack/commit
+- lease acquire/renew/release
+- heartbeat/suspect/fail
 
-- "Users log in with their work account" (could be any SSO provider)
-- "We charge them monthly" (could be any payment processor)
-- "They get notified" (could be any notification infrastructure)
+### Implementation-agnostic requirement language
+
+If stakeholders describe category behavior independent of vendor, the boundary is usually reusable.
 
 ## Questions to ask
 
-When you detect a potential library spec, pause and explore:
-
-1. **"Is this specific to your system, or is it a standard integration?"** If standard, it is likely a library spec candidate.
-
-2. **"Would another system integrating with [X] work the same way?"** If yes, it is definitely a library spec candidate.
-
-3. **"Do you have specific customisations to how [X] works, or is it standard?"** Standard behaviour points to a library spec. Heavy customisation might still be a library spec with configuration.
-
-4. **"Should we look for an existing library spec for [X], or do you need something custom?"** This encourages reuse and saves effort.
+1. Would another system use this same protocol?
+2. Are customization points limited and explicit?
+3. Is provider choice expected to change without product redesign?
+4. Is this behavior primarily integration mechanics rather than domain policy?
 
 ## How to handle the decision
 
-**Option 1: Use an existing library spec**
+### Option 1: Use existing reusable module
 
-"It sounds like you're describing a standard OAuth flow. There's likely an existing library spec for this. Shall we reference that rather than specifying the OAuth details here? Your application spec would just respond to authentication events."
+Prefer reuse when protocol behavior is standard and already modeled.
 
-**Option 2: Create a new library spec**
+### Option 2: Create new reusable module
 
-"The way you're describing this Greenhouse ATS integration sounds generic enough that it could be its own library spec. Other hiring applications might integrate with Greenhouse the same way. Should we create a separate greenhouse-ats.allium spec that this application references?"
+Extract if behavior is generic and likely to recur across projects.
 
-**Option 3: Keep it inline (rare)**
+### Option 3: Keep inline
 
-"This integration is so specific to your system that it probably doesn't make sense as a standalone spec. Let's include it directly."
+Keep inline when behavior is domain-specific and unlikely to be reused.
 
-## Common library spec candidates
+## Common reusable module candidates
 
-| Domain | Likely library specs |
-|--------|---------------------|
-| Authentication | OAuth providers (Google, Microsoft, GitHub), SAML, magic links |
-| Payments | Stripe, PayPal, subscription billing, usage-based billing |
-| Communications | Email delivery, SMS, push notifications, Slack/Teams |
-| Storage | S3-compatible storage, file scanning, image processing |
-| Calendar | Google Calendar, Outlook, iCal feeds |
-| CRM/ATS | Salesforce, HubSpot, Greenhouse, Lever |
-| Analytics | Segment, Mixpanel, event tracking |
-| Infrastructure | Webhook handling, rate limiting, audit logging |
+- Authentication/SSO
+- Payment lifecycle
+- Notification delivery channel management
+- Queue retry/dead-letter logic
+- Webhook verification and retry protocol
 
 ## The boundary question
 
-When you identify a library spec candidate, the key question is: "Where does the library spec end and the application spec begin?"
+Reusable module should own:
 
-The library spec handles:
+- protocol-level event flow
+- retry/timeout/ordering semantics
+- protocol invariants and liveness obligations
 
-- The mechanics of the integration (OAuth flow, payment processing)
-- Events that any consumer would care about (login succeeded, payment failed)
-- Configuration that varies between deployments
+Application module should own:
 
-The application spec handles:
+- domain-specific decisions after protocol events
+- domain entities and policy checks
+- user-visible product behavior
 
-- What happens in your system when those events occur
-- Application-specific entities (your User, your Subscription)
-- Business rules unique to your domain
+### Boundary example
 
-Example boundary:
+```p
+module AuthProtocol = { OAuthBoundary, SessionLifecycle };
+module AppDomain = { UserProvisioning, RoleAssignment };
 
-```
--- Library spec (oauth.allium) handles:
---   - Provider configuration
---   - Token exchange
---   - Session lifecycle
---   - Emits: AuthenticationSucceeded, SessionExpired, etc.
-
--- Application spec handles:
---   - Creating your User entity on first login
---   - What roles/permissions new users get
---   - Blocking suspended users from logging in
---   - Audit logging specific to your compliance needs
+module FullSystem = (union AuthProtocol, AppDomain);
+module CheckedSystem = assert AuthSafety, AppSafety in FullSystem;
 ```
 
-## Red flags you missed a library spec
+## Red flags you missed a module opportunity
 
-During review, watch for:
-
-- **Detailed protocol descriptions.** "First we redirect to Google, then they redirect back with a code, then we exchange it for a token..." This is OAuth. Use a library spec.
-- **Vendor-specific details.** "Stripe sends a webhook with event type `invoice.paid`..." This is Stripe integration. Use a library spec.
-- **Repeated patterns.** If you are specifying similar retry/timeout/error handling for multiple integrations, extract a common pattern.
+- same protocol logic copied across features
+- repeated monitor definitions for the same integration mechanics
+- domain machines bloated with third-party lifecycle details

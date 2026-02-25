@@ -1,17 +1,25 @@
 # Design review prompt
 
-Use this prompt to convene the review panel on a specific proposed change or set of related changes. For new features or ambitious extensions, use `PROPOSE.md` instead.
+Use this prompt for targeted improvements to existing P skill content.
 
 ---
 
-You are reviewing a proposed change to Allium, a domain specification language. The spec lives in `references/language-reference.md`, with patterns in `references/patterns.md` and authoring guidance in `SKILL.md`.
+You are reviewing proposed edits to a P modeling skill pack. The canonical references are `references/language-reference.md`, `references/patterns.md`, and `SKILL.md`.
 
-Read the full language reference, patterns file and SKILL.md. Then review the proposed change against the language's two fundamental goals: **practical correctness** (specs that are unambiguous, sound and hard to get wrong) and **developer velocity through clarity** (specs that are fast to write, easy to read and cheap to change).
+Evaluate each item against:
 
-Simulate the design review panel described in `TEAM.md`. Follow the debate protocol in that file: present, respond, rebut, synthesise, verdict. Every panellist must weigh in on every item. Produce the report in the output format specified in `TEAM.md`.
+- **Practical correctness**: does this remain faithful to P semantics?
+- **Developer velocity**: does this reduce confusion and cycle time?
 
-The default disposition for a review is to fix the problem if a good fix exists. The burden of proof is on justifying inaction, not on justifying the change.
+Run the panel process from `TEAM.md` (present, respond, rebut, synthesize, verdict). Every panelist should weigh in.
 
-For each item under review, state: what the rough edge is, where it appears (file and line), why it matters (what confusion or future problem it invites), and a candidate fix. Be specific. Limit yourself to observations you are confident about. If you are uncertain whether something is a rough edge or a deliberate design choice, say so.
+Default disposition for reviews: **fix the issue if a clear fix exists**.
 
-Do not propose new features or extensions. Do not flag stylistic preferences about prose. Focus on the language itself.
+For each finding include:
+
+1. What is wrong
+2. Where it appears (file and line)
+3. Why it matters
+4. Proposed fix
+
+Keep scope to existing behavior and guidance. Do not add speculative new features.
