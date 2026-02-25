@@ -1,49 +1,69 @@
-# Test generation
+# Test generation and CI from Stateright models
 
-From an Allium specification, generate:
+Model checking and tests should reinforce each other.
 
-**Contract tests** (per rule):
-- Success case: all preconditions met, verify all postconditions hold
-- Failure cases: one test per precondition, verify rule is rejected when that precondition fails
-- Edge cases: boundary values for numeric conditions
+## 1. Generate test ideas from properties
 
-**State transition tests** (per entity with status):
-- Valid transitions succeed via their rules
-- Invalid transitions are rejected (no rule allows them)
-- Terminal states have no outbound transitions
+For each property, derive three concrete test families:
 
-**Temporal tests** (per time-based trigger):
-- Before deadline: rule doesn't fire, state unchanged
-- At deadline: rule fires, postconditions hold
-- After deadline: rule has already fired, doesn't re-fire
+- **Positive witness tests**: confirm intended valid behavior paths.
+- **Negative regression tests**: replay known failing traces and assert they stay fixed.
+- **Boundary tests**: max/min bounds that stress guards and transitions.
 
-**Communication tests** (per Notification/Email/etc):
-- Verify communication is triggered
-- Verify recipient is correct
-- Verify template and data are passed
+## 2. Derive tests from counterexamples
 
-**Scenario tests** (per flow):
-- Happy path through main flow
-- Edge cases and error paths
-- Concurrent scenarios: what happens if two triggers fire simultaneously?
+When Stateright finds a counterexample:
 
-**Sum type tests** (per sum type):
-- Type discrimination: verify each variant has distinct accessible fields
-- Exhaustiveness: verify all variants are handled in conditional logic
-- Invalid state prevention: verify that an entity cannot be multiple variants
-- Type guard correctness: verify variant-specific fields are only accessible within appropriate type guards
+1. save trace actions as fixture data
+2. replay trace in unit/integration test harness
+3. assert the previous violation no longer occurs
 
-**Surface tests** (per surface):
-- Exposure tests: verify each item in `exposes` is accessible to the specified party
-- Provides availability tests: verify provided operations appear when their `when` conditions are true
-- Provides unavailability tests: verify provided operations are hidden when `when` conditions are false
-- Requires tests: verify the surface rejects interaction when required contributions are missing
-- Related surface navigation: verify navigation to related surfaces works
-- Party restriction tests: verify the surface is not accessible to other party types
-- Guarantee tests: verify stated guarantees hold across the boundary
+This keeps checker discoveries alive in the implementation suite.
 
-**Cross-rule interaction tests** (per rule with entity-creating ensures):
-- Re-trigger sibling rules on the same parent while the created entity exists. Verify guards prevent duplicate creation or conflicting state.
-- For each surface `provides` entry, generate unavailability tests for each conjunct in the corresponding rule's requires. One test per conjunct, each falsifying that conjunct, verifying the operation is hidden or rejected.
+## 3. Transition-level tests
 
-**Concurrency note:** Rules are assumed to be atomic, meaning a rule either completes entirely or not at all. If two rules could fire simultaneously on the same entity, test that the resulting state is consistent regardless of order.
+For each action variant:
+
+- enabled-case test (`next_state` returns `Some`)
+- disabled-case test (`next_state` returns `None`)
+- idempotency/replay checks where relevant
+
+## 4. Invariant-aligned tests
+
+Every `Property::always` should map to at least one runtime assertion in code tests.
+
+Examples:
+
+- "at most one leader" -> cluster-state assertion in simulation/integration tests
+- "attempts <= max_attempts" -> retry manager unit test
+- "dedup prevents double apply" -> API retry integration test
+
+## 5. CI tiers
+
+- **PR tier**
+  - small bounds
+  - BFS
+  - strict runtime budget
+
+- **Nightly tier**
+  - deeper bounds
+  - DFS or simulation sweeps
+  - artifact upload for traces
+
+- **Release tier**
+  - targeted deep checks on critical protocols
+  - explicit sign-off for any skipped property
+
+## 6. Minimal CI checklist
+
+- model checks run on every merge request
+- failing traces are archived
+- runtime tests include at least one replayed model counterexample
+- bounds/config used in CI are versioned
+- property names are stable and meaningful
+
+## 7. What not to do
+
+- Do not run only `sometimes` properties in CI.
+- Do not treat simulation runs as exhaustive proof.
+- Do not change bounds silently when checks become slow.
