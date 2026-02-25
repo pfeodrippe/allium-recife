@@ -1,108 +1,82 @@
 # Recognising library spec opportunities
 
-During elicitation, stay alert for descriptions that suggest a library spec rather than application-specific logic. Library specs are standalone specifications for generic integrations that could be reused across projects.
+During elicitation, watch for behavior that should live in reusable Quint modules rather than inline in an application model.
 
-This applies equally to distillation. When examining existing code and finding OAuth flows or payment processing, the same questions apply.
+The same signals apply in distillation.
 
-## Signals that something might be a library spec
+## Strong signals
 
-**External system integration:**
+### External integration language appears
 
-- "We use Google/Microsoft/GitHub for login"
-- "Payments go through Stripe/PayPal"
-- "We send emails via SendGrid/Postmark"
-- "Calendar invites sync with Google Calendar"
-- "We store files in S3/GCS"
+- "Users sign in with Google/Microsoft/GitHub"
+- "Payments are handled by Stripe/PayPal"
+- "Calendar syncs with Google Calendar/Outlook"
+- "Files go to S3/GCS"
+- "Webhook events drive updates"
 
-**Generic patterns being described:**
+### Generic protocol behavior appears
 
-- OAuth flows, session management, token refresh
-- Payment processing, subscriptions, invoicing
-- Email delivery, bounce handling, unsubscribes
-- File upload, virus scanning, thumbnail generation
-- Webhook receipt, retry logic, signature verification
+- OAuth code exchange, token refresh, session expiry
+- Subscription invoicing, retries, dunning
+- Email delivery + bounce handling
+- Webhook signature validation + retry policy
 
-**Implementation-agnostic descriptions:**
+### Vendor names dominate requirements
 
-- "Users log in with their work account" (could be any SSO provider)
-- "We charge them monthly" (could be any payment processor)
-- "They get notified" (could be any notification infrastructure)
+If requirements are mostly provider protocol details, the behavior likely belongs in a library module (`oauth2.qnt`, `billing.qnt`, etc.).
 
 ## Questions to ask
 
-When you detect a potential library spec, pause and explore:
+1. Is this behavior specific to your product, or generic to any integration with this provider?
+2. Would another team integrating the same provider need nearly the same model?
+3. Are you describing provider mechanics, or product policy on top of provider events?
+4. Should we import an existing module or create a reusable local module?
 
-1. **"Is this specific to your system, or is it a standard integration?"** If standard, it is likely a library spec candidate.
+## Decision outcomes
 
-2. **"Would another system integrating with [X] work the same way?"** If yes, it is definitely a library spec candidate.
+### Use existing module
 
-3. **"Do you have specific customisations to how [X] works, or is it standard?"** Standard behaviour points to a library spec. Heavy customisation might still be a library spec with configuration.
+"This sounds like standard OAuth. Let’s import an OAuth module and keep this model focused on user/account policy."
 
-4. **"Should we look for an existing library spec for [X], or do you need something custom?"** This encourages reuse and saves effort.
+### Create new reusable module
 
-## How to handle the decision
+"This Greenhouse ATS flow looks reusable across hiring systems. Let’s capture it as `greenhouse-ats.qnt` and import it."
 
-**Option 1: Use an existing library spec**
+### Keep inline (rare)
 
-"It sounds like you're describing a standard OAuth flow. There's likely an existing library spec for this. Shall we reference that rather than specifying the OAuth details here? Your application spec would just respond to authentication events."
+If behavior is deeply product-specific and unlikely to recur, keep it inline.
 
-**Option 2: Create a new library spec**
+## Common library module candidates
 
-"The way you're describing this Greenhouse ATS integration sounds generic enough that it could be its own library spec. Other hiring applications might integrate with Greenhouse the same way. Should we create a separate greenhouse-ats.allium spec that this application references?"
+| Domain | Typical module names |
+|--------|----------------------|
+| Authentication | `oauth2.qnt`, `saml.qnt`, `magic-link.qnt` |
+| Payments | `stripe-billing.qnt`, `subscriptions.qnt` |
+| Notifications | `email-delivery.qnt`, `push.qnt` |
+| Storage | `object-storage.qnt`, `file-processing.qnt` |
+| Calendar | `calendar-sync.qnt` |
+| Integrations | `webhook-runtime.qnt`, `rate-limiter.qnt` |
 
-**Option 3: Keep it inline (rare)**
+## Boundary rule
 
-"This integration is so specific to your system that it probably doesn't make sense as a standalone spec. Let's include it directly."
+Library module owns provider mechanics.
+Application module owns business consequences.
 
-## Common library spec candidates
+Example split:
 
-| Domain | Likely library specs |
-|--------|---------------------|
-| Authentication | OAuth providers (Google, Microsoft, GitHub), SAML, magic links |
-| Payments | Stripe, PayPal, subscription billing, usage-based billing |
-| Communications | Email delivery, SMS, push notifications, Slack/Teams |
-| Storage | S3-compatible storage, file scanning, image processing |
-| Calendar | Google Calendar, Outlook, iCal feeds |
-| CRM/ATS | Salesforce, HubSpot, Greenhouse, Lever |
-| Analytics | Segment, Mixpanel, event tracking |
-| Infrastructure | Webhook handling, rate limiting, audit logging |
+```quint
+// oauth2.qnt owns:
+// - provider auth/session mechanics
+// - emits auth/session lifecycle events
 
-## The boundary question
-
-When you identify a library spec candidate, the key question is: "Where does the library spec end and the application spec begin?"
-
-The library spec handles:
-
-- The mechanics of the integration (OAuth flow, payment processing)
-- Events that any consumer would care about (login succeeded, payment failed)
-- Configuration that varies between deployments
-
-The application spec handles:
-
-- What happens in your system when those events occur
-- Application-specific entities (your User, your Subscription)
-- Business rules unique to your domain
-
-Example boundary:
-
-```
--- Library spec (oauth.allium) handles:
---   - Provider configuration
---   - Token exchange
---   - Session lifecycle
---   - Emits: AuthenticationSucceeded, SessionExpired, etc.
-
--- Application spec handles:
---   - Creating your User entity on first login
---   - What roles/permissions new users get
---   - Blocking suspended users from logging in
---   - Audit logging specific to your compliance needs
+// app-auth.qnt owns:
+// - create/update local user profile on login
+// - block suspended users
+// - role assignment and audit policy
 ```
 
-## Red flags you missed a library spec
+## Red flags you missed a library opportunity
 
-During review, watch for:
-
-- **Detailed protocol descriptions.** "First we redirect to Google, then they redirect back with a code, then we exchange it for a token..." This is OAuth. Use a library spec.
-- **Vendor-specific details.** "Stripe sends a webhook with event type `invoice.paid`..." This is Stripe integration. Use a library spec.
-- **Repeated patterns.** If you are specifying similar retry/timeout/error handling for multiple integrations, extract a common pattern.
+- Repeated provider protocol steps embedded across multiple features
+- Vendor event names hardcoded throughout business models
+- Same retry/timeout logic copied in multiple modules

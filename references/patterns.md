@@ -1,2559 +1,1111 @@
 # Complete patterns
 
-This library contains reusable patterns for common SaaS scenarios. Each pattern demonstrates specific Allium language features and can be adapted to your domain.
-
-Patterns elide common cross-cutting entities (`Email`, `Notification`, `AuditLog`, etc.) for brevity. In a real specification, declare these as external entities or define them in a shared module.
+This library keeps the same functional pattern set as the original version, now expressed in Quint.
 
 | Pattern | Key Features Demonstrated |
 |---------|---------------------------|
-| Password Auth with Reset | Temporal triggers, token lifecycle, defaults, surfaces |
-| Role-Based Access Control | Derived permissions, relationships, `requires` checks, surfaces |
-| Invitation to Resource | Join entities, permission levels, tokenised actions, surfaces |
-| Soft Delete & Restore | State machines, projections filtering deleted items |
-| Notification Preferences | Sum types for notification variants, user preferences, digest batching, surfaces |
-| Usage Limits & Quotas | Limit checks in `requires`, metered resources, plan tiers, surfaces |
-| Comments with Mentions | Nested entities, parsing triggers, cross-entity notifications, surfaces |
-| Integrating Library Specs | External spec references, configuration, responding to external triggers |
+| Password Authentication with Reset | Lockout, session lifecycle, reset token lifecycle, temporal checks |
+| Role-Based Access Control (RBAC) | Role inheritance, permission checks, membership management |
+| Invitation to Resource | Invitation lifecycle, guest/member flows, share permissions |
+| Soft Delete & Restore | Deleted-state lifecycle, retention expiry, restore window |
+| Notification Preferences & Digests | Notification variants, per-type prefs, digest batching |
+| Usage Limits & Quotas | Plan limits, quota enforcement, reset windows, upgrades/downgrades |
+| Comments with Mentions | Threading, mention parsing, mention/reply notifications, reactions |
+| Integrating Library Specs | OAuth + billing composition with imported modules |
 
 ---
 
 ## Pattern 1: Password Authentication with Reset
 
-**Demonstrates:** Temporal triggers, token lifecycle, defaults, surfaces, multiple related rules
-
-This pattern handles user registration, login and password reset: the foundation of most SaaS applications.
-
-```
--- password-auth.allium
-
-config {
-    min_password_length: Integer = 12
-    max_login_attempts: Integer = 5
-    lockout_duration: Duration = 15.minutes
-    reset_token_expiry: Duration = 1.hour
-    session_duration: Duration = 24.hours
-}
-
-------------------------------------------------------------
--- Entities
-------------------------------------------------------------
-
-entity User {
-    email: String
-    password_hash: String          -- stored, never exposed
-    status: active | locked | deactivated
-    failed_login_attempts: Integer
-    locked_until: Timestamp?
-
-    -- Relationships
-    sessions: Session with user = this
-    reset_tokens: PasswordResetToken with user = this
-
-    -- Projections
-    active_sessions: sessions where status = active
-    pending_reset_tokens: reset_tokens where status = pending
-
-    -- Derived
-    is_locked: status = locked and locked_until > now
-}
-
-entity Session {
-    user: User
-    created_at: Timestamp
-    expires_at: Timestamp
-    status: active | expired | revoked
-
-    -- Derived
-    is_valid: status = active and expires_at > now
-}
-
-entity PasswordResetToken {
-    user: User
-    created_at: Timestamp
-    expires_at: Timestamp
-    status: pending | used | expired
-
-    -- Derived
-    is_valid: status = pending and expires_at > now
-}
-
-------------------------------------------------------------
--- Registration
-------------------------------------------------------------
-
-rule Register {
-    when: UserRegisters(email, password)
-
-    requires: not exists User{email: email}
-    requires: length(password) >= config.min_password_length
-
-    ensures: User.created(
-        email: email,
-        password_hash: hash(password),    -- black box
-        status: active,
-        failed_login_attempts: 0
-    )
-    ensures: Email.created(
-        to: email,
-        template: welcome
-    )
-}
-
-------------------------------------------------------------
--- Login
-------------------------------------------------------------
-
-rule LoginSuccess {
-    when: UserLogsIn(email, password)
-
-    let user = User{email}
-
-    requires: exists user
-    requires: not user.is_locked
-    requires: verify(password, user.password_hash)    -- black box
-
-    ensures: user.failed_login_attempts = 0
-    ensures: Session.created(
-        user: user,
-        created_at: now,
-        expires_at: now + config.session_duration,
-        status: active
-    )
-}
-
-rule LoginFailure {
-    when: UserLogsIn(email, password)
-
-    let user = User{email}
-
-    requires: exists user
-    requires: not user.is_locked
-    requires: not verify(password, user.password_hash)
-
-    ensures: user.failed_login_attempts = user.failed_login_attempts + 1
-    ensures:
-        if user.failed_login_attempts >= config.max_login_attempts:
-            user.status = locked
-            user.locked_until = now + config.lockout_duration
-            Email.created(to: user.email, template: account_locked)
-}
-
-rule LoginAttemptWhileLocked {
-    when: UserLogsIn(email, password)
-
-    let user = User{email}
-
-    requires: exists user
-    requires: user.is_locked
-
-    ensures: UserInformed(
-        user: user,
-        about: account_locked,
-        data: { unlocks_at: user.locked_until }
-    )
-}
-
-rule LockoutExpires {
-    when: user: User.locked_until <= now
-
-    requires: user.status = locked
-
-    ensures: user.status = active
-    ensures: user.failed_login_attempts = 0
-    ensures: user.locked_until = null
-}
-
-------------------------------------------------------------
--- Logout
-------------------------------------------------------------
-
-rule Logout {
-    when: UserLogsOut(session)
-
-    requires: session.status = active
-
-    ensures: session.status = revoked
-}
-
-rule SessionExpires {
-    when: session: Session.expires_at <= now
-
-    requires: session.status = active
-
-    ensures: session.status = expired
-}
-
-------------------------------------------------------------
--- Password Reset
-------------------------------------------------------------
-
-rule RequestPasswordReset {
-    when: UserRequestsPasswordReset(email)
-
-    let user = User{email}
-
-    requires: exists user
-    requires: user.status in {active, locked}
-
-    -- Invalidate any existing tokens
-    ensures:
-        for t in user.pending_reset_tokens:
-            t.status = expired
-
-    ensures:
-        let token = PasswordResetToken.created(
-            user: user,
-            created_at: now,
-            expires_at: now + config.reset_token_expiry,
-            status: pending
-        )
-        Email.created(
-            to: email,
-            template: password_reset,
-            data: { token: token }
-        )
-}
-
-rule CompletePasswordReset {
-    when: UserResetsPassword(token, new_password)
-
-    requires: token.is_valid
-    requires: length(new_password) >= config.min_password_length
-
-    let user = token.user
-
-    ensures: token.status = used
-    ensures: user.password_hash = hash(new_password)
-    ensures: user.status = active
-    ensures: user.failed_login_attempts = 0
-    ensures: user.locked_until = null
-
-    -- Invalidate all existing sessions
-    ensures:
-        for s in user.active_sessions:
-            s.status = revoked
-
-    ensures: Email.created(
-        to: user.email,
-        template: password_changed
-    )
-}
-
-rule ResetTokenExpires {
-    when: token: PasswordResetToken.expires_at <= now
-
-    requires: token.status = pending
-
-    ensures: token.status = expired
-}
-
-------------------------------------------------------------
--- Actors
-------------------------------------------------------------
-
-actor AuthenticatedUser {
-    identified_by: User where active_sessions.count > 0
-}
-
-------------------------------------------------------------
--- Surfaces
-------------------------------------------------------------
-
-surface Authentication {
-    facing visitor: User
-
-    provides:
-        UserLogsIn(email, password)
-        UserRegisters(email, password)
-        UserRequestsPasswordReset(email)
-
-    guarantee: NoSessionRequired
-        -- Accessible without an existing session.
-
-    guidance:
-        -- Show lockout status and unlock time when user.is_locked.
-        -- Validate password length client-side before submission.
-}
-
-surface PasswordReset {
-    facing visitor: User
-
-    context token: PasswordResetToken
-
-    exposes:
-        token.is_valid
-        token.expires_at
-
-    provides:
-        UserResetsPassword(token, new_password)
-            when token.is_valid
-
-    guarantee: NoSessionRequired
-        -- Accessible without an existing session.
-}
-
-surface AccountManagement {
-    facing user: AuthenticatedUser
-
-    exposes:
-        user.email
-        user.active_sessions
-        user.active_sessions.count
-
-    provides:
-        for session in user.active_sessions:
-            UserLogsOut(session)
-        UserRequestsPasswordReset(user.email)
+**Demonstrates:** lockout policy, session expiry, password reset request/complete/expire flows
+
+```quint
+module PasswordAuth {
+  const USERS: Set[str]
+  const MAX_LOGIN_ATTEMPTS: int
+  const LOCKOUT_DURATION: int
+  const RESET_TOKEN_EXPIRY: int
+  const NOW_VALUES: Set[int]
+
+  type UserStatus = | Active | Locked | Deactivated
+  type TokenStatus = | NoToken | Pending | Used | Expired
+
+  var status: str -> UserStatus
+  var failedAttempts: str -> int
+  var lockedUntil: str -> int
+  var activeSessions: str -> int
+  var resetTokenStatus: str -> TokenStatus
+  var resetTokenExpiresAt: str -> int
+
+  action init = all {
+    status' = USERS.mapBy(_ => Active),
+    failedAttempts' = USERS.mapBy(_ => 0),
+    lockedUntil' = USERS.mapBy(_ => 0),
+    activeSessions' = USERS.mapBy(_ => 0),
+    resetTokenStatus' = USERS.mapBy(_ => NoToken),
+    resetTokenExpiresAt' = USERS.mapBy(_ => 0),
+  }
+
+  pure def isLocked(user: str, now: int): bool =
+    status.get(user) == Locked and lockedUntil.get(user) > now
+
+  action loginSuccess(user: str, now: int) = all {
+    USERS.contains(user),
+    status.get(user) == Active,
+    not(isLocked(user, now)),
+    failedAttempts' = failedAttempts.set(user, 0),
+    activeSessions' = activeSessions.setBy(user, n => n + 1),
+    status' = status,
+    lockedUntil' = lockedUntil,
+    resetTokenStatus' = resetTokenStatus,
+    resetTokenExpiresAt' = resetTokenExpiresAt,
+  }
+
+  action loginFailure(user: str, now: int) = all {
+    USERS.contains(user),
+    status.get(user) == Active,
+    not(isLocked(user, now)),
+    failedAttempts' = failedAttempts.setBy(user, n => n + 1),
+    status' = if (failedAttempts.get(user) + 1 >= MAX_LOGIN_ATTEMPTS)
+      status.set(user, Locked)
+      else status,
+    lockedUntil' = if (failedAttempts.get(user) + 1 >= MAX_LOGIN_ATTEMPTS)
+      lockedUntil.set(user, now + LOCKOUT_DURATION)
+      else lockedUntil,
+    activeSessions' = activeSessions,
+    resetTokenStatus' = resetTokenStatus,
+    resetTokenExpiresAt' = resetTokenExpiresAt,
+  }
+
+  action lockoutExpires(user: str, now: int) = all {
+    USERS.contains(user),
+    status.get(user) == Locked,
+    lockedUntil.get(user) <= now,
+    status' = status.set(user, Active),
+    failedAttempts' = failedAttempts.set(user, 0),
+    lockedUntil' = lockedUntil.set(user, 0),
+    activeSessions' = activeSessions,
+    resetTokenStatus' = resetTokenStatus,
+    resetTokenExpiresAt' = resetTokenExpiresAt,
+  }
+
+  action logout(user: str) = all {
+    USERS.contains(user),
+    activeSessions.get(user) > 0,
+    activeSessions' = activeSessions.setBy(user, n => n - 1),
+    status' = status,
+    failedAttempts' = failedAttempts,
+    lockedUntil' = lockedUntil,
+    resetTokenStatus' = resetTokenStatus,
+    resetTokenExpiresAt' = resetTokenExpiresAt,
+  }
+
+  action requestPasswordReset(user: str, now: int) = all {
+    USERS.contains(user),
+    Set(Active, Locked).contains(status.get(user)),
+    resetTokenStatus' = resetTokenStatus.set(user, Pending),
+    resetTokenExpiresAt' = resetTokenExpiresAt.set(user, now + RESET_TOKEN_EXPIRY),
+    status' = status,
+    failedAttempts' = failedAttempts,
+    lockedUntil' = lockedUntil,
+    activeSessions' = activeSessions,
+  }
+
+  action completePasswordReset(user: str, now: int) = all {
+    USERS.contains(user),
+    resetTokenStatus.get(user) == Pending,
+    resetTokenExpiresAt.get(user) > now,
+    resetTokenStatus' = resetTokenStatus.set(user, Used),
+    failedAttempts' = failedAttempts.set(user, 0),
+    status' = if (status.get(user) == Locked) status.set(user, Active) else status,
+    lockedUntil' = if (status.get(user) == Locked) lockedUntil.set(user, 0) else lockedUntil,
+    activeSessions' = activeSessions,
+    resetTokenExpiresAt' = resetTokenExpiresAt,
+  }
+
+  action resetTokenExpires(user: str, now: int) = all {
+    USERS.contains(user),
+    resetTokenStatus.get(user) == Pending,
+    resetTokenExpiresAt.get(user) <= now,
+    resetTokenStatus' = resetTokenStatus.set(user, Expired),
+    status' = status,
+    failedAttempts' = failedAttempts,
+    lockedUntil' = lockedUntil,
+    activeSessions' = activeSessions,
+    resetTokenExpiresAt' = resetTokenExpiresAt,
+  }
+
+  action step = {
+    nondet user = oneOf(USERS)
+    nondet now = oneOf(NOW_VALUES)
+    any {
+      loginSuccess(user, now),
+      loginFailure(user, now),
+      lockoutExpires(user, now),
+      logout(user),
+      requestPasswordReset(user, now),
+      completePasswordReset(user, now),
+      resetTokenExpires(user, now),
+    }
+  }
+
+  val attemptsNonNegative = USERS.forall(u => failedAttempts.get(u) >= 0)
+  val sessionsNonNegative = USERS.forall(u => activeSessions.get(u) >= 0)
 }
 ```
-
-**Key language features shown:**
-- `config` block for configurable parameters (`config.min_password_length`, etc.)
-- Derived values (`is_locked`, `is_valid`)
-- Multiple rules for same trigger with different `requires` (login success vs failure)
-- Temporal triggers with guards (`when: token: PasswordResetToken.expires_at <= now` with `requires: status = pending`)
-- Projections for filtered collections (`pending_reset_tokens`)
-- Bulk updates with `for` iteration
-- Explicit `let` binding for created entities
-- Black box functions (`hash()`, `verify()`)
-- Surfaces with `facing` declaration and `for` iteration in `provides`
 
 ---
 
 ## Pattern 2: Role-Based Access Control (RBAC)
 
-**Demonstrates:** Derived permissions, relationships, using permissions in `requires` clauses, surfaces
-
-This pattern implements hierarchical roles where higher roles inherit permissions from lower ones.
-
-```
--- rbac.allium
-
-------------------------------------------------------------
--- Entities
-------------------------------------------------------------
-
-entity Role {
-    name: String                    -- e.g., "viewer", "editor", "admin"
-    permissions: Set<String>        -- e.g., { "documents.read", "documents.write" }
-    inherits_from: Role?            -- optional parent role
-
-    -- Derived: all permissions including inherited
-    effective_permissions:
-        permissions + (inherits_from?.effective_permissions ?? {})
-}
-
-entity User {
-    email: String
-    name: String
-}
-
-entity Workspace {
-    name: String
-    owner: User
-
-    -- Relationships
-    memberships: WorkspaceMembership with workspace = this
-    documents: Document with workspace = this
-
-    -- Projections
-    members: memberships -> user
-    admins: memberships where role.name = "admin" -> user
-}
-
-entity Document {
-    workspace: Workspace
-    created_by: User
-    title: String
-    content: String
-}
-
-entity DocumentView {
-    user: User
-    document: Document
-    at: Timestamp
-}
-
--- Join entity connecting User, Workspace, and Role
-entity WorkspaceMembership {
-    user: User
-    workspace: Workspace
-    role: Role
-    joined_at: Timestamp
-
-    -- Derived: check specific permissions
-    can_read: "documents.read" in role.effective_permissions
-    can_write: "documents.write" in role.effective_permissions
-    can_admin: "workspace.admin" in role.effective_permissions
-}
-
-------------------------------------------------------------
--- Defaults
-------------------------------------------------------------
-
-default Role viewer = {
-    name: "viewer",
-    permissions: { "documents.read" }
-}
-
-default Role editor = {
-    name: "editor",
-    permissions: { "documents.write" },
-    inherits_from: viewer
-}
-
-default Role admin = {
-    name: "admin",
-    permissions: { "workspace.admin", "members.manage" },
-    inherits_from: editor
-}
-
-------------------------------------------------------------
--- Rules
-------------------------------------------------------------
-
-rule CreateWorkspace {
-    when: UserCreatesWorkspace(user, name)
-
-    ensures:
-        let workspace = Workspace.created(
-            name: name,
-            owner: user
-        )
-        -- Owner automatically becomes admin
-        WorkspaceMembership.created(
-            user: user,
-            workspace: workspace,
-            role: admin,
-            joined_at: now
-        )
-}
-
-rule AddMember {
-    when: AddMemberToWorkspace(actor, workspace, new_user, role)
-
-    let actor_membership = WorkspaceMembership{user: actor, workspace: workspace}
-
-    requires: actor_membership.can_admin
-    requires: not exists WorkspaceMembership{user: new_user, workspace: workspace}
-
-    ensures: WorkspaceMembership.created(
-        user: new_user,
-        workspace: workspace,
-        role: role,
-        joined_at: now
-    )
-    ensures: Email.created(
-        to: new_user.email,
-        template: added_to_workspace,
-        data: { workspace: workspace, role: role }
-    )
-}
-
-rule ChangeMemberRole {
-    when: ChangeMemberRole(actor, workspace, target_user, new_role)
-
-    let actor_membership = WorkspaceMembership{user: actor, workspace: workspace}
-    let target_membership = WorkspaceMembership{user: target_user, workspace: workspace}
-
-    requires: actor_membership.can_admin
-    requires: exists target_membership
-    requires: target_user != workspace.owner    -- can't change owner's role
-
-    ensures: target_membership.role = new_role
-}
-
-rule RemoveMember {
-    when: RemoveMemberFromWorkspace(actor, workspace, target_user)
-
-    let actor_membership = WorkspaceMembership{user: actor, workspace: workspace}
-    let target_membership = WorkspaceMembership{user: target_user, workspace: workspace}
-
-    requires: actor_membership.can_admin
-    requires: exists target_membership
-    requires: target_user != workspace.owner    -- can't remove owner
-
-    ensures: not exists target_membership
-}
-
-rule LeaveWorkspace {
-    when: UserLeavesWorkspace(user, workspace)
-
-    let membership = WorkspaceMembership{user, workspace}
-
-    requires: exists membership
-    requires: user != workspace.owner    -- owner can't leave
-
-    ensures: not exists membership
-}
-
-------------------------------------------------------------
--- Managing permissions on roles
-------------------------------------------------------------
-
-rule GrantPermission {
-    when: GrantPermission(actor, workspace, role, permission)
-
-    let actor_membership = WorkspaceMembership{user: actor, workspace: workspace}
-
-    requires: actor_membership.can_admin
-    requires: permission not in role.effective_permissions
-
-    ensures: role.permissions.add(permission)
-}
-
-rule RevokePermission {
-    when: RevokePermission(actor, workspace, role, permission)
-
-    let actor_membership = WorkspaceMembership{user: actor, workspace: workspace}
-
-    requires: actor_membership.can_admin
-    requires: permission in role.permissions    -- only direct, not inherited
-
-    ensures: role.permissions.remove(permission)
-}
-
-------------------------------------------------------------
--- Using permissions in other rules
-------------------------------------------------------------
-
-rule CreateDocument {
-    when: CreateDocument(user, workspace, title, content)
-
-    let membership = WorkspaceMembership{user, workspace}
-
-    requires: membership.can_write
-
-    ensures: Document.created(
-        workspace: workspace,
-        created_by: user,
-        title: title,
-        content: content
-    )
-}
-
-rule ViewDocument {
-    when: ViewDocument(user, document)
-
-    let membership = WorkspaceMembership{user: user, workspace: document.workspace}
-
-    requires: membership.can_read
-
-    ensures: DocumentView.created(user: user, document: document, at: now)
-}
-
-------------------------------------------------------------
--- Actors
-------------------------------------------------------------
-
-actor WorkspaceAdmin {
-    within: Workspace
-    identified_by: User where WorkspaceMembership{user: this, workspace: within}.can_admin = true
-}
-
-actor WorkspaceEditor {
-    within: Workspace
-    identified_by: User where WorkspaceMembership{user: this, workspace: within}.can_write = true
-}
-
-actor WorkspaceViewer {
-    within: Workspace
-    identified_by: User where WorkspaceMembership{user: this, workspace: within}.can_read = true
-}
-
-------------------------------------------------------------
--- Surfaces
-------------------------------------------------------------
-
-surface WorkspaceMemberManagement {
-    facing admin: WorkspaceAdmin
-
-    context workspace: Workspace
-
-    exposes:
-        workspace.name
-        workspace.memberships
-        workspace.admins
-
-    provides:
-        AddMemberToWorkspace(admin, workspace, new_user, role)
-        ChangeMemberRole(admin, workspace, target_user, new_role)
-            when target_user != workspace.owner
-        RemoveMemberFromWorkspace(admin, workspace, target_user)
-            when target_user != workspace.owner
-
-    guarantee: OwnerProtection
-        -- The workspace owner's role cannot be changed or removed.
-}
-
-surface WorkspaceDocuments {
-    facing member: User
-
-    context workspace: Workspace
-
-    let membership = WorkspaceMembership{user: member, workspace: workspace}
-
-    exposes:
-        workspace.name
-        workspace.documents
-
-    provides:
-        CreateDocument(member, workspace, title, content)
-            when membership.can_write
-        for document in workspace.documents:
-            ViewDocument(member, document)
-                when membership.can_read
-
-    related:
-        WorkspaceMemberManagement(workspace)
-            when membership.can_admin
+**Demonstrates:** hierarchical roles, permission inheritance, workspace membership operations
+
+```quint
+module RBAC {
+  const USERS: Set[str]
+  const WORKSPACES: Set[str]
+
+  type Role = | Viewer | Editor | Admin
+
+  var membershipRole: (str, str) -> Role
+  var documentsPerWorkspace: str -> int
+
+  pure def rolePermissions(role: Role): Set[str] =
+    match role {
+      | Viewer => Set("documents.read")
+      | Editor => Set("documents.read", "documents.write")
+      | Admin => Set("documents.read", "documents.write", "workspace.admin", "members.manage")
+    }
+
+  pure def canRead(user: str, workspace: str): bool =
+    rolePermissions(membershipRole.get((workspace, user))).contains("documents.read")
+
+  pure def canWrite(user: str, workspace: str): bool =
+    rolePermissions(membershipRole.get((workspace, user))).contains("documents.write")
+
+  pure def canAdmin(user: str, workspace: str): bool =
+    rolePermissions(membershipRole.get((workspace, user))).contains("workspace.admin")
+
+  action init = all {
+    membershipRole' = WORKSPACES.cross(USERS).mapBy(_ => Viewer),
+    documentsPerWorkspace' = WORKSPACES.mapBy(_ => 0),
+  }
+
+  action addMember(actor: str, workspace: str, newUser: str, role: Role) = all {
+    canAdmin(actor, workspace),
+    membershipRole' = membershipRole.set((workspace, newUser), role),
+    documentsPerWorkspace' = documentsPerWorkspace,
+  }
+
+  action changeMemberRole(actor: str, workspace: str, user: str, role: Role) = all {
+    canAdmin(actor, workspace),
+    membershipRole' = membershipRole.set((workspace, user), role),
+    documentsPerWorkspace' = documentsPerWorkspace,
+  }
+
+  action removeMember(actor: str, workspace: str, user: str) = all {
+    canAdmin(actor, workspace),
+    membershipRole' = membershipRole.set((workspace, user), Viewer),
+    documentsPerWorkspace' = documentsPerWorkspace,
+  }
+
+  action createDocument(user: str, workspace: str) = all {
+    canWrite(user, workspace),
+    documentsPerWorkspace' = documentsPerWorkspace.setBy(workspace, n => n + 1),
+    membershipRole' = membershipRole,
+  }
+
+  action step = {
+    nondet actor = oneOf(USERS)
+    nondet user = oneOf(USERS)
+    nondet workspace = oneOf(WORKSPACES)
+    nondet role = oneOf(Set(Viewer, Editor, Admin))
+    any {
+      addMember(actor, workspace, user, role),
+      changeMemberRole(actor, workspace, user, role),
+      removeMember(actor, workspace, user),
+      createDocument(actor, workspace),
+    }
+  }
+
+  val docCountNonNegative = WORKSPACES.forall(w => documentsPerWorkspace.get(w) >= 0)
 }
 ```
-
-**Key language features shown:**
-- Recursive derived values (`effective_permissions` includes inherited)
-- Null-safe navigation (`inherits_from?.effective_permissions ?? {}`)
-- Join entity lookup (`WorkspaceMembership{user: actor, workspace: workspace}`)
-- Permission checks in `requires` clauses
-- String set membership with `in` operator
-- `.add()` and `.remove()` for set mutation in ensures clauses
-- `not exists` as an outcome (removes the entity)
-- Surfaces with role-based actors and permission-gated actions
-- `related` clause for cross-surface navigation
 
 ---
 
 ## Pattern 3: Invitation to Resource
 
-**Demonstrates:** Tokenised actions, permission levels, invitation lifecycle, guest vs member flows, surfaces
+**Demonstrates:** invitation lifecycle, permission levels, accept/decline/revoke/expire
 
-This pattern handles inviting users to collaborate on resources, whether they're existing users or not.
+```quint
+module ResourceInvitation {
+  const RESOURCES: Set[str]
+  const USERS: Set[str]
+  const INVITATIONS: Set[int]
+  const NOW_VALUES: Set[int]
+  const INVITATION_EXPIRY: int
 
-```
--- resource-invitation.allium
+  type SharePermission = | View | Edit | Admin
+  type InviteStatus = | Pending | Accepted | Declined | Expired | Revoked
 
-config {
-    invitation_expiry: Duration = 7.days
-}
+  type Invite = {
+    resource: str,
+    email: str,
+    permission: SharePermission,
+    invitedBy: str,
+    expiresAt: int,
+    status: InviteStatus,
+  }
 
-------------------------------------------------------------
--- Entities
-------------------------------------------------------------
+  var invites: int -> Invite
+  var sharePermission: (str, str) -> SharePermission
+  var shareActive: (str, str) -> bool
 
-entity Resource {
-    name: String
-    owner: User
+  action init = all {
+    invites' = INVITATIONS.mapBy(_ => {
+      resource: "",
+      email: "",
+      permission: View,
+      invitedBy: "",
+      expiresAt: 0,
+      status: Revoked,
+    }),
+    sharePermission' = RESOURCES.cross(USERS).mapBy(_ => View),
+    shareActive' = RESOURCES.cross(USERS).mapBy(_ => false),
+  }
 
-    -- Relationships
-    shares: ResourceShare with resource = this
-    invitations: ResourceInvitation with resource = this
+  action inviteToResource(invId: int, inviter: str, resource: str, email: str, permission: SharePermission, now: int) = all {
+    INVITATIONS.contains(invId),
+    invites.get(invId).status != Pending,
+    invites' = invites.set(invId, {
+      resource: resource,
+      email: email,
+      permission: permission,
+      invitedBy: inviter,
+      expiresAt: now + INVITATION_EXPIRY,
+      status: Pending,
+    }),
+    sharePermission' = sharePermission,
+    shareActive' = shareActive,
+  }
 
-    -- Projections
-    active_shares: shares where status = active
-    pending_invitations: invitations where status = pending
-}
+  action acceptInvitationExistingUser(invId: int, user: str) = all {
+    invites.get(invId).status == Pending,
+    invites' = invites.setBy(invId, i => { resource: i.resource, email: i.email, permission: i.permission, invitedBy: i.invitedBy, expiresAt: i.expiresAt, status: Accepted }),
+    sharePermission' = sharePermission.set((invites.get(invId).resource, user), invites.get(invId).permission),
+    shareActive' = shareActive.set((invites.get(invId).resource, user), true),
+  }
 
-entity ResourceShare {
-    resource: Resource
-    user: User
-    permission: view | edit | admin
-    status: active | revoked
-    created_at: Timestamp
+  action declineInvitation(invId: int) = all {
+    invites.get(invId).status == Pending,
+    invites' = invites.setBy(invId, i => { resource: i.resource, email: i.email, permission: i.permission, invitedBy: i.invitedBy, expiresAt: i.expiresAt, status: Declined }),
+    sharePermission' = sharePermission,
+    shareActive' = shareActive,
+  }
 
-    -- Derived
-    can_view: permission in {view, edit, admin}
-    can_edit: permission in {edit, admin}
-    can_admin: permission = admin
-    can_invite: permission in {edit, admin}    -- editors and admins can invite
-}
+  action invitationExpires(invId: int, now: int) = all {
+    invites.get(invId).status == Pending,
+    invites.get(invId).expiresAt <= now,
+    invites' = invites.setBy(invId, i => { resource: i.resource, email: i.email, permission: i.permission, invitedBy: i.invitedBy, expiresAt: i.expiresAt, status: Expired }),
+    sharePermission' = sharePermission,
+    shareActive' = shareActive,
+  }
 
-entity ResourceInvitation {
-    resource: Resource
-    email: String
-    permission: view | edit | admin
-    invited_by: User
-    created_at: Timestamp
-    expires_at: Timestamp
-    status: pending | accepted | declined | expired | revoked
+  action revokeInvitation(invId: int) = all {
+    invites.get(invId).status == Pending,
+    invites' = invites.setBy(invId, i => { resource: i.resource, email: i.email, permission: i.permission, invitedBy: i.invitedBy, expiresAt: i.expiresAt, status: Revoked }),
+    sharePermission' = sharePermission,
+    shareActive' = shareActive,
+  }
 
-    -- Derived
-    is_valid: status = pending and expires_at > now
-}
+  action changeSharePermission(resource: str, user: str, permission: SharePermission) = all {
+    shareActive.get((resource, user)),
+    sharePermission' = sharePermission.set((resource, user), permission),
+    invites' = invites,
+    shareActive' = shareActive,
+  }
 
-------------------------------------------------------------
--- Inviting
-------------------------------------------------------------
+  action revokeShare(resource: str, user: str) = all {
+    shareActive.get((resource, user)),
+    shareActive' = shareActive.set((resource, user), false),
+    invites' = invites,
+    sharePermission' = sharePermission,
+  }
 
-rule InviteToResource {
-    when: InviteToResource(inviter, resource, email, permission)
-
-    let inviter_share = ResourceShare{resource: resource, user: inviter}
-    let existing_invitation = ResourceInvitation{resource: resource, email: email}
-
-    requires: inviter = resource.owner or inviter_share.can_invite
-    requires: permission in {view, edit}    -- can't invite as admin unless owner
-              or (permission = admin and inviter = resource.owner)
-    requires: not exists ResourceShare{resource: resource, user: User{email: email}}
-    requires: not exists existing_invitation or not existing_invitation.is_valid
-
-    ensures: ResourceInvitation.created(
-        resource: resource,
-        email: email,
-        permission: permission,
-        invited_by: inviter,
-        created_at: now,
-        expires_at: now + config.invitation_expiry,
-        status: pending
-    )
-    ensures: Email.created(
-        to: email,
-        template: resource_invitation,
-        data: {
-            resource: resource,
-            inviter: inviter,
-            permission: permission
-        }
-    )
-}
-
-------------------------------------------------------------
--- Accepting (existing user)
-------------------------------------------------------------
-
-rule AcceptInvitationExistingUser {
-    when: ExistingUserAcceptsInvitation(invitation, user)
-
-    requires: invitation.is_valid
-    requires: user.email = invitation.email
-
-    ensures: invitation.status = accepted
-    ensures: ResourceShare.created(
-        resource: invitation.resource,
-        user: user,
-        permission: invitation.permission,
-        status: active,
-        created_at: now
-    )
-    ensures: Notification.created(
-        to: invitation.invited_by,
-        template: invitation_accepted,
-        data: { resource: invitation.resource, user: user }
-    )
-}
-
-------------------------------------------------------------
--- Accepting (new user - triggers signup flow)
-------------------------------------------------------------
-
-rule AcceptInvitationNewUser {
-    when: NewUserAcceptsInvitation(invitation, email, name, password)
-
-    requires: invitation.is_valid
-    requires: email = invitation.email
-    requires: not exists User{email: email}
-
-    ensures:
-        let user = User.created(
-            email: email,
-            name: name,
-            password_hash: hash(password),
-            status: active
-        )
-        invitation.status = accepted
-        ResourceShare.created(
-            resource: invitation.resource,
-            user: user,
-            permission: invitation.permission,
-            status: active,
-            created_at: now
-        )
-        Notification.created(
-            to: invitation.invited_by,
-            template: invitation_accepted,
-            data: { resource: invitation.resource, user: user }
-        )
-}
-
-------------------------------------------------------------
--- Declining and expiring
-------------------------------------------------------------
-
-rule DeclineInvitation {
-    when: DeclineInvitation(invitation)
-
-    requires: invitation.is_valid
-
-    ensures: invitation.status = declined
-}
-
-rule InvitationExpires {
-    when: invitation: ResourceInvitation.expires_at <= now
-
-    requires: invitation.status = pending
-
-    ensures: invitation.status = expired
-}
-
-rule RevokeInvitation {
-    when: RevokeInvitation(actor, invitation)
-
-    let actor_share = ResourceShare{resource: invitation.resource, user: actor}
-
-    requires: invitation.status = pending
-    requires: actor = invitation.resource.owner or actor_share.can_admin
-
-    ensures: invitation.status = revoked
-}
-
-------------------------------------------------------------
--- Managing shares
-------------------------------------------------------------
-
-rule ChangeSharePermission {
-    when: ChangeSharePermission(actor, share, new_permission)
-
-    let actor_share = ResourceShare{resource: share.resource, user: actor}
-
-    requires: actor = share.resource.owner or actor_share.can_admin
-    requires: share.user != share.resource.owner    -- can't change owner
-    requires: share.status = active
-
-    ensures: share.permission = new_permission
-}
-
-rule RevokeShare {
-    when: RevokeShare(actor, share)
-
-    let actor_share = ResourceShare{resource: share.resource, user: actor}
-
-    requires: actor = share.resource.owner or actor_share.can_admin
-    requires: share.user != share.resource.owner
-    requires: share.status = active
-
-    ensures: share.status = revoked
-    ensures: Notification.created(
-        to: share.user,
-        template: access_revoked,
-        data: { resource: share.resource }
-    )
-}
-
-------------------------------------------------------------
--- Surfaces
-------------------------------------------------------------
-
-surface ResourceSharing {
-    facing sharer: User
-
-    context resource: Resource
-
-    let share = ResourceShare{resource: resource, user: sharer}
-
-    exposes:
-        resource.active_shares
-        resource.pending_invitations
-
-    provides:
-        InviteToResource(sharer, resource, email, permission)
-            when sharer = resource.owner or share.can_invite
-        for invitation in resource.pending_invitations:
-            RevokeInvitation(sharer, invitation)
-                when sharer = resource.owner or share.can_admin
-        for s in resource.active_shares:
-            ChangeSharePermission(sharer, s, new_permission)
-                when sharer = resource.owner or share.can_admin
-            RevokeShare(sharer, s)
-                when sharer = resource.owner or share.can_admin
-
-    guarantee: OwnerCannotBeRevoked
-        -- The resource owner's access cannot be revoked or downgraded.
-}
-
-surface InvitationResponse {
-    facing recipient: User
-
-    context invitation: ResourceInvitation where email = recipient.email
-
-    exposes:
-        invitation.resource.name
-        invitation.permission
-        invitation.invited_by.name
-        invitation.expires_at
-        invitation.is_valid
-
-    provides:
-        ExistingUserAcceptsInvitation(invitation, recipient)
-            when invitation.is_valid
-        DeclineInvitation(invitation)
-            when invitation.is_valid
+  action step = {
+    nondet invId = oneOf(INVITATIONS)
+    nondet user = oneOf(USERS)
+    nondet resource = oneOf(RESOURCES)
+    nondet now = oneOf(NOW_VALUES)
+    nondet permission = oneOf(Set(View, Edit, Admin))
+    any {
+      inviteToResource(invId, user, resource, user, permission, now),
+      acceptInvitationExistingUser(invId, user),
+      declineInvitation(invId),
+      invitationExpires(invId, now),
+      revokeInvitation(invId),
+      changeSharePermission(resource, user, permission),
+      revokeShare(resource, user),
+    }
+  }
 }
 ```
-
-**Key language features shown:**
-- Complex permission logic in `requires`
-- Distinct trigger names for different parameter shapes (`ExistingUserAcceptsInvitation` vs `NewUserAcceptsInvitation`)
-- Invitation lifecycle (pending → accepted/declined/expired/revoked)
-- Checking existence with `exists` keyword
-- Permission escalation prevention (`can't invite as admin unless owner`)
-- Surfaces for both resource owner and invitation recipient boundaries
-- Conditional `provides` with `for` iteration over collections
 
 ---
 
 ## Pattern 4: Soft Delete & Restore
 
-**Demonstrates:** Simple state machines, projections that filter deleted items, retention policies
+**Demonstrates:** soft delete, restore permissions, retention-based hard delete
 
-This pattern implements soft delete where items appear deleted but can be restored within a retention period.
+```quint
+module SoftDelete {
+  const DOCUMENTS: Set[int]
+  const USERS: Set[str]
+  const NOW_VALUES: Set[int]
+  const RETENTION_PERIOD: int
 
-```
--- soft-delete.allium
+  type DocStatus = | Active | Deleted | Purged
 
-config {
-    retention_period: Duration = 30.days
-}
+  var status: int -> DocStatus
+  var deletedAt: int -> int
+  var deletedBy: int -> str
 
-------------------------------------------------------------
--- Entities
-------------------------------------------------------------
+  action init = all {
+    status' = DOCUMENTS.mapBy(_ => Active),
+    deletedAt' = DOCUMENTS.mapBy(_ => 0),
+    deletedBy' = DOCUMENTS.mapBy(_ => ""),
+  }
 
-entity Document {
-    workspace: Workspace
-    title: String
-    content: String
-    created_by: User
-    created_at: Timestamp
-    status: active | deleted
-    deleted_at: Timestamp?
-    deleted_by: User?
+  action deleteDocument(actor: str, doc: int, now: int) = all {
+    USERS.contains(actor),
+    status.get(doc) == Active,
+    status' = status.set(doc, Deleted),
+    deletedAt' = deletedAt.set(doc, now),
+    deletedBy' = deletedBy.set(doc, actor),
+  }
 
-    -- Derived
-    is_active: status = active
-    retention_expires_at: deleted_at + config.retention_period
-    can_restore: status = deleted and retention_expires_at > now
-}
+  action restoreDocument(actor: str, doc: int, now: int) = all {
+    status.get(doc) == Deleted,
+    deletedAt.get(doc) + RETENTION_PERIOD > now,
+    status' = status.set(doc, Active),
+    deletedAt' = deletedAt.set(doc, 0),
+    deletedBy' = deletedBy.set(doc, ""),
+  }
 
--- Extend Workspace to show how projections filter
-entity Workspace {
-    name: String
+  action permanentlyDelete(doc: int) = all {
+    status.get(doc) == Deleted,
+    status' = status.set(doc, Purged),
+    deletedAt' = deletedAt,
+    deletedBy' = deletedBy,
+  }
 
-    -- Relationships
-    all_documents: Document with workspace = this
+  action retentionExpires(doc: int, now: int) = all {
+    status.get(doc) == Deleted,
+    deletedAt.get(doc) + RETENTION_PERIOD <= now,
+    status' = status.set(doc, Purged),
+    deletedAt' = deletedAt,
+    deletedBy' = deletedBy,
+  }
 
-    -- Projections (what users typically see)
-    documents: all_documents where status = active
-    deleted_documents: all_documents where status = deleted
-    restorable_documents: all_documents where can_restore = true
-}
-
-------------------------------------------------------------
--- Rules
-------------------------------------------------------------
-
-rule DeleteDocument {
-    when: DeleteDocument(actor, document)
-
-    let membership = WorkspaceMembership{user: actor, workspace: document.workspace}
-
-    requires: document.status = active
-    requires: actor = document.created_by or membership.can_admin
-
-    ensures: document.status = deleted
-    ensures: document.deleted_at = now
-    ensures: document.deleted_by = actor
-}
-
-rule RestoreDocument {
-    when: RestoreDocument(actor, document)
-
-    let membership = WorkspaceMembership{user: actor, workspace: document.workspace}
-
-    requires: document.can_restore
-    requires: actor = document.deleted_by or membership.can_admin
-
-    ensures: document.status = active
-    ensures: document.deleted_at = null
-    ensures: document.deleted_by = null
-}
-
-rule PermanentlyDelete {
-    when: PermanentlyDelete(actor, document)
-
-    let membership = WorkspaceMembership{user: actor, workspace: document.workspace}
-
-    requires: document.status = deleted
-    requires: membership.can_admin
-
-    ensures: not exists document    -- actually removed
-}
-
-rule RetentionExpires {
-    when: document: Document.retention_expires_at <= now
-
-    requires: document.status = deleted
-
-    ensures: not exists document
-}
-
-------------------------------------------------------------
--- Bulk operations
-------------------------------------------------------------
-
-rule EmptyTrash {
-    when: EmptyTrash(actor, workspace)
-
-    let membership = WorkspaceMembership{user: actor, workspace: workspace}
-
-    requires: membership.can_admin
-
-    ensures:
-        for d in workspace.deleted_documents:
-            not exists d
-}
-
-rule RestoreAll {
-    when: RestoreAllDeleted(actor, workspace)
-
-    let membership = WorkspaceMembership{user: actor, workspace: workspace}
-
-    requires: membership.can_admin
-
-    ensures:
-        for d in workspace.restorable_documents:
-            d.status = active
-            d.deleted_at = null
-            d.deleted_by = null
+  action step = {
+    nondet actor = oneOf(USERS)
+    nondet doc = oneOf(DOCUMENTS)
+    nondet now = oneOf(NOW_VALUES)
+    any {
+      deleteDocument(actor, doc, now),
+      restoreDocument(actor, doc, now),
+      permanentlyDelete(doc),
+      retentionExpires(doc, now),
+    }
+  }
 }
 ```
-
-**Key language features shown:**
-- `status` field with clear lifecycle
-- Nullable timestamps (`deleted_at: Timestamp?`)
-- Projections filtering by status (`documents: all_documents where status = active`)
-- Derived values using config (`retention_expires_at: deleted_at + config.retention_period`)
-- Temporal trigger for automatic cleanup (`when: document: Document.retention_expires_at <= now`)
-- `not exists` for permanent removal, as distinct from soft delete
-- Bulk operations with `for` iteration
 
 ---
 
 ## Pattern 5: Notification Preferences & Digests
 
-**Demonstrates:** Sum types for notification variants, user preferences affecting rule behaviour, digest batching, temporal triggers, surfaces
-
-This pattern handles in-app notifications with user-controlled email preferences and digest batching. It uses sum types to model different notification kinds, each carrying its own contextual data rather than pre-computed strings.
-
-```
--- notifications.allium
-
-------------------------------------------------------------
--- Entities
-------------------------------------------------------------
-
-entity User {
-    email: String
-    name: String
-    next_digest_at: Timestamp?
-
-    -- Relationships
-    notification_setting: NotificationSetting with user = this
-    notifications: Notification with user = this
-
-    -- Projections
-    unread_notifications: notifications where status = unread
-    pending_email_notifications: notifications where email_status = pending
-    recent_pending_notifications: notifications where email_status = pending and created_at >= now - 24.hours
-}
-
-entity NotificationSetting {
-    user: User
-
-    -- Per-type email preferences
-    email_on_mention: immediately | daily_digest | never
-    email_on_comment: immediately | daily_digest | never
-    email_on_share: immediately | daily_digest | never
-    email_on_assignment: immediately | daily_digest | never
-
-    -- Global settings
-    digest_enabled: Boolean
-    digest_day_of_week: Set<DayOfWeek>    -- domain type; define as enum in your spec
-}
-
-------------------------------------------------------------
--- Notification Sum Type
-------------------------------------------------------------
-
--- Base notification entity with shared fields
-entity Notification {
-    user: User
-    created_at: Timestamp
-    status: unread | read | archived
-    email_status: pending | sent | skipped | digested
-    kind: MentionNotification | ReplyNotification | ShareNotification |
-          AssignmentNotification | SystemNotification
-
-    -- Derived
-    is_unread: status = unread
-}
-
--- Someone @mentioned the user in a comment
-variant MentionNotification : Notification {
-    comment: Comment
-    mentioned_by: User
-}
-
--- Someone replied to the user's comment
-variant ReplyNotification : Notification {
-    reply: Comment              -- the new reply
-    original_comment: Comment   -- the user's comment being replied to
-    replied_by: User
-}
-
--- Someone shared a resource with the user
-variant ShareNotification : Notification {
-    resource: Resource
-    shared_by: User
-    permission: view | edit | admin
-}
-
--- Someone assigned a task to the user
-variant AssignmentNotification : Notification {
-    task: Task
-    assigned_by: User
-}
-
--- System-generated notification (catch-all for non-structured notifications)
-variant SystemNotification : Notification {
-    title: String
-    body: String
-    link: String?
-}
-
-------------------------------------------------------------
--- Supporting Entities
-------------------------------------------------------------
-
-entity DigestBatch {
-    user: User
-    notifications: Set<Notification>
-    created_at: Timestamp
-    sent_at: Timestamp?
-    status: pending | sent | failed
-}
-
-------------------------------------------------------------
--- Creating notifications (type-specific rules)
-------------------------------------------------------------
-
-rule CreateMentionNotification {
-    when: UserMentioned(user, comment, mentioned_by)
-
-    let settings = user.notification_setting
-
-    requires: user != mentioned_by    -- don't notify self
-
-    ensures: MentionNotification.created(
-        user: user,
-        comment: comment,
-        mentioned_by: mentioned_by,
-        created_at: now,
-        status: unread,
-        email_status: if settings.email_on_mention = never: skipped else: pending
-    )
-}
-
-rule CreateReplyNotification {
-    when: CommentReplied(original_author, reply, original_comment)
-
-    let settings = original_author.notification_setting
-
-    requires: original_author != reply.author    -- don't notify self
-
-    ensures: ReplyNotification.created(
-        user: original_author,
-        reply: reply,
-        original_comment: original_comment,
-        replied_by: reply.author,
-        created_at: now,
-        status: unread,
-        email_status: if settings.email_on_comment = never: skipped else: pending
-    )
-}
-
-rule CreateShareNotification {
-    when: ResourceShared(user, resource, shared_by, permission)
-
-    let settings = user.notification_setting
-
-    requires: user != shared_by    -- don't notify self
-
-    ensures: ShareNotification.created(
-        user: user,
-        resource: resource,
-        shared_by: shared_by,
-        permission: permission,
-        created_at: now,
-        status: unread,
-        email_status: if settings.email_on_share = never: skipped else: pending
-    )
-}
-
-rule CreateAssignmentNotification {
-    when: TaskAssigned(user, task, assigned_by)
-
-    let settings = user.notification_setting
-
-    requires: user != assigned_by    -- don't notify self
-
-    ensures: AssignmentNotification.created(
-        user: user,
-        task: task,
-        assigned_by: assigned_by,
-        created_at: now,
-        status: unread,
-        email_status: if settings.email_on_assignment = never: skipped else: pending
-    )
-}
-
-rule CreateSystemNotification {
-    when: SystemNotificationTriggered(user, title, body, link)
-
-    ensures: SystemNotification.created(
-        user: user,
-        title: title,
-        body: body,
-        link: link,
-        created_at: now,
-        status: unread,
-        email_status: pending
-    )
-}
-
-------------------------------------------------------------
--- Immediate email sending
-------------------------------------------------------------
-
-rule SendImmediateEmail {
-    when: notification: Notification.created
-
-    let settings = notification.user.notification_setting
-    let preference =
-        if notification.kind = MentionNotification: settings.email_on_mention
-        else if notification.kind = ReplyNotification: settings.email_on_comment
-        else if notification.kind = ShareNotification: settings.email_on_share
-        else if notification.kind = AssignmentNotification: settings.email_on_assignment
-        else: immediately    -- system notifications send immediately by default
-
-    requires: notification.email_status = pending
-    requires: preference = immediately
-
-    ensures: Email.created(
-        to: notification.user.email,
-        template: notification_immediate,
-        data: { notification: notification }
-    )
-    ensures: notification.email_status = sent
-}
-
-------------------------------------------------------------
--- Reading notifications
-------------------------------------------------------------
-
-rule MarkAsRead {
-    when: MarkNotificationRead(user, notification)
-
-    requires: notification.user = user
-    requires: notification.status = unread
-
-    ensures: notification.status = read
-}
-
-rule MarkAllAsRead {
-    when: MarkAllNotificationsRead(user)
-
-    ensures:
-        for n in user.unread_notifications:
-            n.status = read
-}
-
-rule ArchiveNotification {
-    when: ArchiveNotification(user, notification)
-
-    requires: notification.user = user
-
-    ensures: notification.status = archived
-}
-
-------------------------------------------------------------
--- Daily digest
-------------------------------------------------------------
-
-rule CreateDailyDigest {
-    when: user: User.next_digest_at <= now
-
-    requires: user.notification_setting.digest_enabled
-
-    let pending = user.recent_pending_notifications
-
-    requires: pending.count > 0
-
-    ensures: DigestBatch.created(
-        user: user,
-        notifications: pending,
-        created_at: now,
-        status: pending
-    )
-    ensures:
-        for n in pending:
-            n.email_status = digested
-    ensures: user.next_digest_at = next_digest_time(user)    -- black box; uses digest_day_of_week
-}
-
-rule SendDigest {
-    when: batch: DigestBatch.created
-
-    requires: batch.status = pending
-    requires: batch.notifications.count > 0
-
-    ensures: Email.created(
-        to: batch.user.email,
-        template: daily_digest,
-        data: {
-            notifications: batch.notifications,
-            unread_count: batch.user.unread_notifications.count
-        }
-    )
-    ensures: batch.status = sent
-    ensures: batch.sent_at = now
-}
-
-------------------------------------------------------------
--- Preference updates
-------------------------------------------------------------
-
-rule UpdateNotificationPreferences {
-    when: UpdatePreferences(user, preferences)
-
-    let settings = user.notification_setting
-
-    ensures: settings.email_on_mention = preferences.mention
-    ensures: settings.email_on_comment = preferences.comment
-    ensures: settings.email_on_share = preferences.share
-    ensures: settings.email_on_assignment = preferences.assignment
-    ensures: settings.digest_enabled = preferences.digest_enabled
-    ensures: settings.digest_day_of_week = preferences.digest_days
-}
-
-------------------------------------------------------------
--- Surfaces
-------------------------------------------------------------
-
-surface NotificationCentre {
-    facing user: User
-
-    exposes:
-        user.unread_notifications
-        user.unread_notifications.count
-        user.notifications
-
-    provides:
-        for notification in user.unread_notifications:
-            MarkNotificationRead(user, notification)
-        MarkAllNotificationsRead(user)
-            when user.unread_notifications.count > 0
-        for notification in user.notifications:
-            ArchiveNotification(user, notification)
-
-    related:
-        NotificationPreferences(user)
-}
-
-surface NotificationPreferences {
-    facing user: User
-
-    context settings: NotificationSetting where user = user
-
-    exposes:
-        settings.email_on_mention
-        settings.email_on_comment
-        settings.email_on_share
-        settings.email_on_assignment
-        settings.digest_enabled
-        settings.digest_day_of_week
-
-    provides:
-        UpdatePreferences(user, preferences)
+**Demonstrates:** notification variants, per-type email preference, immediate vs digest delivery
+
+```quint
+module Notifications {
+  const USERS: Set[str]
+  const NOTIFICATIONS: Set[int]
+  const NOW_VALUES: Set[int]
+
+  type EmailPreference = | Immediately | DailyDigest | Never
+  type NotificationStatus = | Unread | Read | Archived
+  type EmailStatus = | Pending | Sent | Skipped | Digested
+
+  type NotificationKind =
+    | Mention(commentId: int, mentionedBy: str)
+    | Reply(replyId: int, originalCommentId: int, repliedBy: str)
+    | Share(resource: str, sharedBy: str)
+    | Assignment(taskId: int, assignedBy: str)
+    | System(title: str)
+
+  type Notification = {
+    user: str,
+    kind: NotificationKind,
+    status: NotificationStatus,
+    emailStatus: EmailStatus,
+    createdAt: int,
+  }
+
+  var notification: int -> Notification
+  var used: Set[int]
+
+  var prefMention: str -> EmailPreference
+  var prefReply: str -> EmailPreference
+  var prefShare: str -> EmailPreference
+  var prefAssignment: str -> EmailPreference
+  var digestEnabled: str -> bool
+  var nextDigestAt: str -> int
+
+  action init = all {
+    notification' = NOTIFICATIONS.mapBy(_ => {
+      user: "",
+      kind: System(""),
+      status: Archived,
+      emailStatus: Skipped,
+      createdAt: 0,
+    }),
+    used' = Set(),
+    prefMention' = USERS.mapBy(_ => Immediately),
+    prefReply' = USERS.mapBy(_ => Immediately),
+    prefShare' = USERS.mapBy(_ => Immediately),
+    prefAssignment' = USERS.mapBy(_ => Immediately),
+    digestEnabled' = USERS.mapBy(_ => true),
+    nextDigestAt' = USERS.mapBy(_ => 24),
+  }
+
+  pure def preferenceFor(user: str, kind: NotificationKind): EmailPreference =
+    match kind {
+      | Mention(_, _) => prefMention.get(user)
+      | Reply(_, _, _) => prefReply.get(user)
+      | Share(_, _) => prefShare.get(user)
+      | Assignment(_, _) => prefAssignment.get(user)
+      | System(_) => Immediately
+    }
+
+  action createNotification(id: int, user: str, kind: NotificationKind, now: int) = all {
+    NOTIFICATIONS.contains(id),
+    not(used.contains(id)),
+    notification' = notification.set(id, {
+      user: user,
+      kind: kind,
+      status: Unread,
+      emailStatus: if (preferenceFor(user, kind) == Never) Skipped else Pending,
+      createdAt: now,
+    }),
+    used' = used.union(Set(id)),
+    prefMention' = prefMention,
+    prefReply' = prefReply,
+    prefShare' = prefShare,
+    prefAssignment' = prefAssignment,
+    digestEnabled' = digestEnabled,
+    nextDigestAt' = nextDigestAt,
+  }
+
+  action sendImmediateEmail(id: int) = all {
+    used.contains(id),
+    notification.get(id).emailStatus == Pending,
+    preferenceFor(notification.get(id).user, notification.get(id).kind) == Immediately,
+    notification' = notification.setBy(id, n => {
+      user: n.user,
+      kind: n.kind,
+      status: n.status,
+      emailStatus: Sent,
+      createdAt: n.createdAt,
+    }),
+    used' = used,
+    prefMention' = prefMention,
+    prefReply' = prefReply,
+    prefShare' = prefShare,
+    prefAssignment' = prefAssignment,
+    digestEnabled' = digestEnabled,
+    nextDigestAt' = nextDigestAt,
+  }
+
+  action createDailyDigest(user: str, now: int) = all {
+    digestEnabled.get(user),
+    nextDigestAt.get(user) <= now,
+    notification' = notification.setBy(id, n =>
+      if (used.contains(id) and n.user == user and n.emailStatus == Pending)
+      { user: n.user, kind: n.kind, status: n.status, emailStatus: Digested, createdAt: n.createdAt }
+      else n),
+    nextDigestAt' = nextDigestAt.set(user, now + 24),
+    used' = used,
+    prefMention' = prefMention,
+    prefReply' = prefReply,
+    prefShare' = prefShare,
+    prefAssignment' = prefAssignment,
+    digestEnabled' = digestEnabled,
+  }
+
+  action markRead(id: int) = all {
+    used.contains(id),
+    notification.get(id).status == Unread,
+    notification' = notification.setBy(id, n => {
+      user: n.user,
+      kind: n.kind,
+      status: Read,
+      emailStatus: n.emailStatus,
+      createdAt: n.createdAt,
+    }),
+    used' = used,
+    prefMention' = prefMention,
+    prefReply' = prefReply,
+    prefShare' = prefShare,
+    prefAssignment' = prefAssignment,
+    digestEnabled' = digestEnabled,
+    nextDigestAt' = nextDigestAt,
+  }
+
+  action step = {
+    nondet id = oneOf(NOTIFICATIONS)
+    nondet user = oneOf(USERS)
+    nondet now = oneOf(NOW_VALUES)
+    any {
+      createNotification(id, user, Mention(1, user), now),
+      createNotification(id, user, Reply(2, 1, user), now),
+      createNotification(id, user, Share("doc", user), now),
+      createNotification(id, user, Assignment(7, user), now),
+      sendImmediateEmail(id),
+      createDailyDigest(user, now),
+      markRead(id),
+    }
+  }
 }
 ```
-
-**Key language features shown:**
-- **Sum types**: `kind: MentionNotification | ReplyNotification | ...` declares notification variants
-- **Variant declarations**: Each notification kind uses `variant X : Notification` syntax
-- **Variant-specific creation rules**: Each variant has its own creation rule with appropriate fields
-- **Exhaustive kind checking**: `SendImmediateEmail` handles all variants explicitly
-- User preferences stored as entity
-- Temporal trigger for per-user digest scheduling (`when: user: User.next_digest_at <= now`)
-- Digest batching with temporal trigger
-- Surfaces with `related` clause linking notification centre to preferences
-
-**Why sum types here?**
-
-The previous approach used pre-computed `title`, `body`, and `link` strings:
-```
-Notification.created(
-    type: mention,
-    title: "{author} mentioned you",
-    body: truncate(comment.body, 100),
-    link: comment.parent.url
-)
-```
-
-With sum types, each notification carries its actual entity references:
-```
-MentionNotification.created(
-    comment: comment,
-    mentioned_by: author
-)
-```
-
-This is better because:
-1. **Rich queries**: "Show all notifications about this document" queries the actual relationships
-2. **Type safety**: Creating a `MentionNotification` requires a `comment` - you can't forget it
-3. **Flexible rendering**: Display logic can access full entity data, not just truncated strings
-4. **Consistency**: If a user's name changes, notification titles reflect the current name
 
 ---
 
 ## Pattern 6: Usage Limits & Quotas
 
-**Demonstrates:** Limit checks in `requires`, metered resources, plan tiers, overage handling, surfaces
-
-This pattern handles SaaS usage limits: different plans have different quotas, and usage is tracked and enforced.
-
-```
--- usage-limits.allium
-
-------------------------------------------------------------
--- Entities
-------------------------------------------------------------
-
-entity Plan {
-    name: String                    -- e.g., "free", "pro", "enterprise"
-
-    -- Limits (null = unlimited)
-    max_documents: Integer?
-    max_storage_bytes: Integer?
-    max_team_members: Integer?
-    max_api_requests_per_day: Integer?
-
-    -- Features
-    features: Set<Feature>          -- domain type; define in your spec
-
-    -- Derived
-    has_unlimited_documents: max_documents = null
-    has_unlimited_storage: max_storage_bytes = null
-    has_unlimited_members: max_team_members = null
-}
-
-entity Workspace {
-    name: String
-    owner: User
-    plan: Plan
-    api_key: String?
-
-    -- Relationships
-    documents: Document with workspace = this
-    memberships: WorkspaceMembership with workspace = this
-    usage: WorkspaceUsage with workspace = this
-
-    -- Derived checks
-    can_add_document: plan.has_unlimited_documents or documents.count < plan.max_documents
-    can_add_member: plan.has_unlimited_members or memberships.count < plan.max_team_members
-    can_use_feature(f): f in plan.features
-}
-
-entity WorkspaceUsage {
-    workspace: Workspace
-    storage_bytes_used: Integer
-    api_requests_today: Integer
-    next_reset_at: Timestamp
-
-    -- Derived (null when plan has no limit)
-    api_requests_remaining:
-        workspace.plan.max_api_requests_per_day - api_requests_today
-    has_api_quota: workspace.plan.max_api_requests_per_day != null
-    is_over_api_quota: has_api_quota and api_requests_remaining <= 0
-}
-
-entity UsageEvent {
-    workspace: Workspace
-    type: document_created | document_deleted | storage_added |
-          storage_removed | api_request | member_added | member_removed
-    amount: Integer
-    recorded_at: Timestamp
-}
-
-------------------------------------------------------------
--- Defaults
-------------------------------------------------------------
-
-default Plan free = {
-    name: "free",
-    max_documents: 10,
-    max_storage_bytes: 100_000_000,    -- 100MB
-    max_team_members: 3,
-    max_api_requests_per_day: 100,
-    features: { basic_editing }
-}
-
-default Plan pro = {
-    name: "pro",
-    max_documents: 1000,
-    max_storage_bytes: 10_000_000_000,  -- 10GB
-    max_team_members: 20,
-    max_api_requests_per_day: 10000,
-    features: { basic_editing, advanced_editing, api_access, integrations }
-}
-
-default Plan enterprise = {
-    name: "enterprise",
-    features: { basic_editing, advanced_editing, api_access, integrations,
-                sso, audit_log, custom_branding }
-    -- max_documents, max_storage_bytes, max_team_members,
-    -- max_api_requests_per_day all null (unlimited)
-}
-
-------------------------------------------------------------
--- Enforcing limits
-------------------------------------------------------------
-
-rule CreateDocument {
-    when: CreateDocument(user, workspace, title)
-
-    requires: workspace.can_add_document
-
-    ensures: Document.created(workspace: workspace, title: title, created_by: user)
-    ensures: UsageEvent.created(
-        workspace: workspace,
-        type: document_created,
-        amount: 1,
-        recorded_at: now
-    )
-}
-
-rule CreateDocumentLimitReached {
-    when: CreateDocument(user, workspace, title)
-
-    requires: not workspace.can_add_document
-
-    ensures: UserInformed(
-        user: user,
-        about: limit_reached,
-        data: {
-            limit_type: documents,
-            current: workspace.documents.count,
-            max: workspace.plan.max_documents,
-            upgrade_path: next_plan(workspace.plan)
-        }
-    )
-}
-
-rule AddTeamMember {
-    when: AddMember(actor, workspace, new_member, role)
-
-    requires: workspace.can_add_member
-    requires: WorkspaceMembership{user: actor, workspace: workspace}.can_admin
-
-    ensures: WorkspaceMembership.created(...)
-    ensures: UsageEvent.created(
-        workspace: workspace,
-        type: member_added,
-        amount: 1,
-        recorded_at: now
-    )
-}
-
-rule UseFeature {
-    when: UseFeature(user, workspace, feature)
-
-    requires: workspace.can_use_feature(feature)
-
-    ensures: FeatureUsed(workspace: workspace, feature: feature, by: user)
-}
-
-rule UseFeatureNotAvailable {
-    when: UseFeature(user, workspace, feature)
-
-    requires: not workspace.can_use_feature(feature)
-
-    ensures: UserInformed(
-        user: user,
-        about: feature_not_available,
-        data: {
-            feature: feature,
-            available_on: plans_with_feature(feature)
-        }
-    )
-}
-
-------------------------------------------------------------
--- API rate limiting
-------------------------------------------------------------
-
-rule RecordApiRequest {
-    when: ApiRequestReceived(workspace, endpoint)
-
-    let usage = workspace.usage
-
-    requires: not usage.is_over_api_quota
-
-    ensures: usage.api_requests_today = usage.api_requests_today + 1
-    ensures: UsageEvent.created(
-        workspace: workspace,
-        type: api_request,
-        amount: 1,
-        recorded_at: now
-    )
-}
-
-rule ApiRateLimitExceeded {
-    when: ApiRequestReceived(workspace, endpoint)
-
-    let usage = workspace.usage
-
-    requires: usage.is_over_api_quota
-
-    ensures: ApiResponse.created(
-        status: 429,
-        body: {
-            error: "rate_limit_exceeded",
-            resets_at: usage.next_reset_at
-        }
-    )
-}
-
-rule ResetDailyApiUsage {
-    when: usage: WorkspaceUsage.next_reset_at <= now
-
-    ensures: usage.api_requests_today = 0
-    ensures: usage.next_reset_at = usage.next_reset_at + 1.day
-}
-
-------------------------------------------------------------
--- Plan changes
-------------------------------------------------------------
-
-rule UpgradePlan {
-    when: UpgradePlan(workspace, new_plan)
-
-    let old_plan = workspace.plan
-
-    requires: new_plan.max_documents >= old_plan.max_documents
-              or new_plan.has_unlimited_documents
-
-    ensures: workspace.plan = new_plan
-    ensures: Email.created(
-        to: workspace.owner.email,
-        template: plan_upgraded,
-        data: { old_plan: old_plan, new_plan: new_plan }
-    )
-}
-
-rule DowngradePlan {
-    when: DowngradePlan(workspace, new_plan)
-
-    let old_plan = workspace.plan
-
-    -- Can only downgrade if under new plan's limits
-    requires: workspace.documents.count <= new_plan.max_documents
-              or new_plan.has_unlimited_documents
-    requires: workspace.memberships.count <= new_plan.max_team_members
-              or new_plan.has_unlimited_members
-    requires: workspace.usage.storage_bytes_used <= new_plan.max_storage_bytes
-              or new_plan.has_unlimited_storage
-
-    ensures: workspace.plan = new_plan
-    ensures: Email.created(
-        to: workspace.owner.email,
-        template: plan_downgraded,
-        data: { old_plan: old_plan, new_plan: new_plan }
-    )
-}
-
-rule DowngradeBlocked {
-    when: DowngradePlan(workspace, new_plan)
-
-    let over_documents =
-        workspace.documents.count > new_plan.max_documents
-        and not new_plan.has_unlimited_documents
-    let over_members =
-        workspace.memberships.count > new_plan.max_team_members
-        and not new_plan.has_unlimited_members
-    let over_storage =
-        workspace.usage.storage_bytes_used > new_plan.max_storage_bytes
-        and not new_plan.has_unlimited_storage
-
-    requires: over_documents or over_members or over_storage
-
-    ensures: UserInformed(
-        user: workspace.owner,
-        about: downgrade_blocked,
-        data: {
-            over_documents: over_documents,
-            over_members: over_members,
-            over_storage: over_storage
-        }
-    )
-}
-
-------------------------------------------------------------
--- Actors
-------------------------------------------------------------
-
-actor WorkspaceOwner {
-    within: Workspace
-    identified_by: User where this = within.owner
-}
-
-------------------------------------------------------------
--- Surfaces
-------------------------------------------------------------
-
-surface UsageDashboard {
-    facing owner: WorkspaceOwner
-
-    context workspace: Workspace
-
-    exposes:
-        workspace.plan
-        workspace.documents.count
-        workspace.plan.max_documents
-        workspace.memberships.count
-        workspace.plan.max_team_members
-        workspace.usage.storage_bytes_used
-        workspace.plan.max_storage_bytes
-        workspace.usage.api_requests_today
-        workspace.usage.api_requests_remaining
-
-    provides:
-        UpgradePlan(workspace, new_plan)
-        DowngradePlan(workspace, new_plan)
-
-    guidance:
-        -- Show progress bars for usage against limits.
-        -- Highlight when any resource is above 80% of its limit.
-}
-
-surface APIAccess {
-    facing consumer: Workspace
-
-    exposes:
-        consumer.usage.api_requests_remaining
-        consumer.plan.max_api_requests_per_day
-
-    provides:
-        ApiRequestReceived(consumer, endpoint)
-            when not consumer.usage.is_over_api_quota
-
-    guarantee: RateLimitEnforcement
-        -- Requests beyond the daily limit receive HTTP 429 with
-        -- reset time.
+**Demonstrates:** plan tiers, quota checks, rate limits, resets, upgrades/downgrades
+
+```quint
+module UsageLimits {
+  const WORKSPACES: Set[str]
+  const NOW_VALUES: Set[int]
+
+  type Plan = | Free | Pro | Enterprise
+
+  var plan: str -> Plan
+  var documents: str -> int
+  var members: str -> int
+  var storageBytes: str -> int
+  var apiRequestsToday: str -> int
+  var nextResetAt: str -> int
+
+  pure def maxDocuments(p: Plan): int =
+    match p { | Free => 10 | Pro => 1000 | Enterprise => 1_000_000 }
+
+  pure def maxMembers(p: Plan): int =
+    match p { | Free => 3 | Pro => 20 | Enterprise => 1_000_000 }
+
+  pure def maxApiRequests(p: Plan): int =
+    match p { | Free => 100 | Pro => 10_000 | Enterprise => 1_000_000 }
+
+  action init = all {
+    plan' = WORKSPACES.mapBy(_ => Free),
+    documents' = WORKSPACES.mapBy(_ => 0),
+    members' = WORKSPACES.mapBy(_ => 1),
+    storageBytes' = WORKSPACES.mapBy(_ => 0),
+    apiRequestsToday' = WORKSPACES.mapBy(_ => 0),
+    nextResetAt' = WORKSPACES.mapBy(_ => 24),
+  }
+
+  action createDocument(workspace: str) = all {
+    documents.get(workspace) < maxDocuments(plan.get(workspace)),
+    documents' = documents.setBy(workspace, n => n + 1),
+    members' = members,
+    storageBytes' = storageBytes,
+    apiRequestsToday' = apiRequestsToday,
+    nextResetAt' = nextResetAt,
+    plan' = plan,
+  }
+
+  action addMember(workspace: str) = all {
+    members.get(workspace) < maxMembers(plan.get(workspace)),
+    members' = members.setBy(workspace, n => n + 1),
+    documents' = documents,
+    storageBytes' = storageBytes,
+    apiRequestsToday' = apiRequestsToday,
+    nextResetAt' = nextResetAt,
+    plan' = plan,
+  }
+
+  action recordApiRequest(workspace: str) = all {
+    apiRequestsToday.get(workspace) < maxApiRequests(plan.get(workspace)),
+    apiRequestsToday' = apiRequestsToday.setBy(workspace, n => n + 1),
+    documents' = documents,
+    members' = members,
+    storageBytes' = storageBytes,
+    nextResetAt' = nextResetAt,
+    plan' = plan,
+  }
+
+  action resetDailyApiUsage(workspace: str, now: int) = all {
+    nextResetAt.get(workspace) <= now,
+    apiRequestsToday' = apiRequestsToday.set(workspace, 0),
+    nextResetAt' = nextResetAt.set(workspace, now + 24),
+    documents' = documents,
+    members' = members,
+    storageBytes' = storageBytes,
+    plan' = plan,
+  }
+
+  action upgradePlan(workspace: str, newPlan: Plan) = all {
+    plan.get(workspace) != newPlan,
+    plan' = plan.set(workspace, newPlan),
+    documents' = documents,
+    members' = members,
+    storageBytes' = storageBytes,
+    apiRequestsToday' = apiRequestsToday,
+    nextResetAt' = nextResetAt,
+  }
+
+  action downgradePlan(workspace: str, newPlan: Plan) = all {
+    documents.get(workspace) <= maxDocuments(newPlan),
+    members.get(workspace) <= maxMembers(newPlan),
+    apiRequestsToday.get(workspace) <= maxApiRequests(newPlan),
+    plan' = plan.set(workspace, newPlan),
+    documents' = documents,
+    members' = members,
+    storageBytes' = storageBytes,
+    apiRequestsToday' = apiRequestsToday,
+    nextResetAt' = nextResetAt,
+  }
+
+  action step = {
+    nondet workspace = oneOf(WORKSPACES)
+    nondet now = oneOf(NOW_VALUES)
+    nondet p = oneOf(Set(Free, Pro, Enterprise))
+    any {
+      createDocument(workspace),
+      addMember(workspace),
+      recordApiRequest(workspace),
+      resetDailyApiUsage(workspace, now),
+      upgradePlan(workspace, p),
+      downgradePlan(workspace, p),
+    }
+  }
 }
 ```
-
-**Key language features shown:**
-- Plan definitions with limits
-- Derived boolean checks for limit enforcement (`can_add_document`, `can_add_member`)
-- `requires` checking limits before actions
-- Paired rules for success/failure cases
-- Usage tracking with events
-- Temporal trigger for daily reset (`when: usage: WorkspaceUsage.next_reset_at <= now`)
-- Plan upgrade/downgrade logic with `let` binding to capture pre-mutation state
-- Feature flags (`can_use_feature(f)`)
-- Interaction surface for usage dashboard and API surface with rate limit guarantee
 
 ---
 
 ## Pattern 7: Comments with Mentions
 
-**Demonstrates:** Nested entities, parsing for mentions, cross-entity notifications, threading, surfaces
+**Demonstrates:** replies, mentions, mention/reply notification triggers, reactions
 
-This pattern implements comments with @mentions, including mention parsing and notification generation.
+```quint
+module Comments {
+  const COMMENTS: Set[int]
+  const USERS: Set[str]
 
-```
--- comments.allium
+  type CommentStatus = | Active | Deleted
+  type Reaction = (int, str, str)
 
-------------------------------------------------------------
--- Entities
-------------------------------------------------------------
+  var status: int -> CommentStatus
+  var author: int -> str
+  var replyTo: int -> int
+  var mentionsByComment: int -> Set[str]
+  var reactions: Set[Reaction]
 
-external entity User {
-    name: String
-    is_admin: Boolean
-}
+  var mentionEvents: Set[(str, int, str)]
+  var replyEvents: Set[(str, int, int)]
 
-external entity Commentable {
-    -- Defined by the consuming spec (e.g., Document, Task, Project)
-}
+  action init = all {
+    status' = COMMENTS.mapBy(_ => Active),
+    author' = COMMENTS.mapBy(_ => ""),
+    replyTo' = COMMENTS.mapBy(_ => 0),
+    mentionsByComment' = COMMENTS.mapBy(_ => Set()),
+    reactions' = Set(),
+    mentionEvents' = Set(),
+    replyEvents' = Set(),
+  }
 
-entity Comment {
-    parent: Commentable
-    reply_to: Comment?              -- null for top-level, set for replies
-    author: User
-    body: String
-    created_at: Timestamp
-    edited_at: Timestamp?
-    status: active | deleted
+  action createComment(c: int, u: str, mentionedUsers: Set[str]) = all {
+    COMMENTS.contains(c),
+    USERS.contains(u),
+    author' = author.set(c, u),
+    replyTo' = replyTo.set(c, 0),
+    mentionsByComment' = mentionsByComment.set(c, mentionedUsers),
+    status' = status,
+    reactions' = reactions,
+    mentionEvents' = mentionEvents,
+    replyEvents' = replyEvents,
+  }
 
-    -- Relationships
-    mentions: CommentMention with comment = this
-    replies: Comment with reply_to = this
-    reactions: CommentReaction with comment = this
+  action createReply(c: int, parent: int, u: str, mentionedUsers: Set[str]) = all {
+    COMMENTS.contains(c),
+    COMMENTS.contains(parent),
+    status.get(parent) == Active,
+    USERS.contains(u),
+    author' = author.set(c, u),
+    replyTo' = replyTo.set(c, parent),
+    mentionsByComment' = mentionsByComment.set(c, mentionedUsers),
+    replyEvents' = if (author.get(parent) != u and not(mentionedUsers.contains(author.get(parent))))
+      replyEvents.union(Set((author.get(parent), c, parent)))
+      else replyEvents,
+    status' = status,
+    reactions' = reactions,
+    mentionEvents' = mentionEvents,
+  }
 
-    -- Projections
-    active_replies: replies where status = active
+  action notifyMentionedUser(c: int, mentioned: str) = all {
+    mentionsByComment.get(c).contains(mentioned),
+    mentioned != author.get(c),
+    mentionEvents' = mentionEvents.union(Set((mentioned, c, author.get(c)))),
+    status' = status,
+    author' = author,
+    replyTo' = replyTo,
+    mentionsByComment' = mentionsByComment,
+    reactions' = reactions,
+    replyEvents' = replyEvents,
+  }
 
-    -- Derived
-    is_reply: reply_to != null
-    is_edited: edited_at != null
-    mentioned_users: mentions -> user
-    thread_depth: if is_reply: reply_to.thread_depth + 1 else: 0
-}
+  action editComment(c: int, newMentionedUsers: Set[str]) = all {
+    status.get(c) == Active,
+    mentionsByComment' = mentionsByComment.set(c, newMentionedUsers),
+    status' = status,
+    author' = author,
+    replyTo' = replyTo,
+    reactions' = reactions,
+    mentionEvents' = mentionEvents,
+    replyEvents' = replyEvents,
+  }
 
--- Join entity for mentions
-entity CommentMention {
-    comment: Comment
-    user: User
-    notified: Boolean
-}
+  action deleteComment(c: int) = all {
+    status.get(c) == Active,
+    status' = status.set(c, Deleted),
+    author' = author,
+    replyTo' = replyTo,
+    mentionsByComment' = mentionsByComment,
+    reactions' = reactions,
+    mentionEvents' = mentionEvents,
+    replyEvents' = replyEvents,
+  }
 
-entity CommentReaction {
-    comment: Comment
-    user: User
-    emoji: String                   -- e.g., "👍", "❤️", "🎉"
-    created_at: Timestamp
-}
-
-------------------------------------------------------------
--- Creating comments
-------------------------------------------------------------
-
-rule CreateComment {
-    when: CreateComment(author, parent, body)
-
-    let mentioned_usernames = parse_mentions(body)    -- black box: extracts @username
-    let mentioned_users = users_with_usernames(mentioned_usernames)    -- black box lookup
-
-    ensures:
-        let comment = Comment.created(
-            parent: parent,
-            reply_to: null,
-            author: author,
-            body: body,
-            created_at: now,
-            status: active
-        )
-        for user in mentioned_users:
-            CommentMention.created(
-                comment: comment,
-                user: user,
-                notified: false
-            )
-}
-
-rule CreateReply {
-    when: CreateReply(author, parent_comment, body)
-
-    let mentioned_usernames = parse_mentions(body)
-    let mentioned_users = users_with_usernames(mentioned_usernames)    -- black box lookup
-
-    requires: parent_comment.status = active
-    requires: parent_comment.thread_depth < 3    -- limit nesting
-
-    ensures:
-        let comment = Comment.created(
-            parent: parent_comment.parent,
-            reply_to: parent_comment,
-            author: author,
-            body: body,
-            created_at: now,
-            status: active
-        )
-        for user in mentioned_users:
-            CommentMention.created(
-                comment: comment,
-                user: user,
-                notified: false
-            )
-}
-
-------------------------------------------------------------
--- Notifications for mentions and replies
-------------------------------------------------------------
-
--- Trigger the notification system when someone is mentioned
-rule NotifyMentionedUser {
-    when: mention: CommentMention.created
-
-    requires: mention.user != mention.comment.author    -- don't notify self
-    requires: not mention.notified
-
-    ensures: mention.notified = true
-    ensures: UserMentioned(
-        user: mention.user,
-        comment: mention.comment,
-        mentioned_by: mention.comment.author
-    )
-}
-
--- Trigger the notification system when someone's comment receives a reply
-rule NotifyCommentAuthorOfReply {
-    when: comment: Comment.created
-
-    let original_author = comment.reply_to?.author
-
-    requires: comment.is_reply
-    requires: original_author != null
-    requires: original_author != comment.author    -- don't notify self
-    requires: original_author not in comment.mentioned_users    -- avoid double notify
-
-    ensures: CommentReplied(
-        original_author: original_author,
-        reply: comment,
-        original_comment: comment.reply_to
-    )
-}
-
-------------------------------------------------------------
--- Editing
-------------------------------------------------------------
-
-rule EditComment {
-    when: EditComment(actor, comment, new_body)
-
-    requires: actor = comment.author
-    requires: comment.status = active
-
-    let old_mentions = comment.mentioned_users
-    let new_mentioned_usernames = parse_mentions(new_body)
-    let new_mentioned_users = users_with_usernames(new_mentioned_usernames)    -- black box lookup
-    let added_mentions = new_mentioned_users - old_mentions
-    let removed_mentions = old_mentions - new_mentioned_users
-
-    ensures: comment.body = new_body
-    ensures: comment.edited_at = now
-
-    -- Remove old mentions that are no longer present
-    ensures: for user in removed_mentions:
-        not exists CommentMention{comment, user}
-
-    -- Add new mentions
-    ensures: for user in added_mentions:
-        CommentMention.created(
-            comment: comment,
-            user: user,
-            notified: false
-        )
-}
-
-------------------------------------------------------------
--- Deleting
-------------------------------------------------------------
-
-rule DeleteComment {
-    when: DeleteComment(actor, comment)
-
-    requires: actor = comment.author or actor.is_admin
-    requires: comment.status = active
-
-    ensures: comment.status = deleted
-    -- Note: replies remain but show "deleted comment"
-}
-
-------------------------------------------------------------
--- Reactions
-------------------------------------------------------------
-
-rule AddReaction {
-    when: AddReaction(user, comment, emoji)
-
-    requires: comment.status = active
-    requires: not exists CommentReaction{comment, user, emoji}
-
-    ensures: CommentReaction.created(
-        comment: comment,
-        user: user,
-        emoji: emoji,
-        created_at: now
-    )
-}
-
-rule RemoveReaction {
-    when: RemoveReaction(user, comment, emoji)
-
-    let reaction = CommentReaction{comment, user, emoji}
-
-    requires: comment.status = active
-    requires: exists reaction
-
-    ensures: not exists reaction
-}
-
-rule ToggleReaction {
-    when: ToggleReaction(user, comment, emoji)
-
-    let existing = CommentReaction{comment, user, emoji}
-
-    requires: comment.status = active
-
-    ensures:
-        if exists existing:
-            not exists existing
-        else:
-            CommentReaction.created(
-                comment: comment,
-                user: user,
-                emoji: emoji,
-                created_at: now
-            )
-}
-
-------------------------------------------------------------
--- Surfaces
-------------------------------------------------------------
-
-surface CommentThread {
-    facing viewer: User
-
-    context parent: Commentable
-
-    let comments = Comments where parent = parent and status = active
-
-    exposes:
-        for comment in comments:
-            comment.author.name
-            comment.body
-            comment.created_at
-            comment.is_edited
-            comment.active_replies
-            comment.reactions
-
-    provides:
-        CreateComment(viewer, parent, body)
-        for comment in comments:
-            CreateReply(viewer, comment, body)
-                when comment.thread_depth < 3
-            EditComment(viewer, comment, new_body)
-                when viewer = comment.author
-            DeleteComment(viewer, comment)
-                when viewer = comment.author or viewer.is_admin
-            AddReaction(viewer, comment, emoji)
-            RemoveReaction(viewer, comment, emoji)
-                when exists CommentReaction{comment: comment, user: viewer, emoji: emoji}
-
-    guidance:
-        -- Show "edited" indicator when comment.is_edited.
-        -- Show "deleted comment" placeholder for deleted replies
-        -- rather than removing them from the thread.
+  action toggleReaction(c: int, u: str, emoji: str) = all {
+    status.get(c) == Active,
+    reactions' = if (reactions.contains((c, u, emoji)))
+      reactions.exclude((c, u, emoji))
+      else reactions.union(Set((c, u, emoji))),
+    status' = status,
+    author' = author,
+    replyTo' = replyTo,
+    mentionsByComment' = mentionsByComment,
+    mentionEvents' = mentionEvents,
+    replyEvents' = replyEvents,
+  }
 }
 ```
-
-**Key language features shown:**
-- Nested/recursive entities (comments with replies)
-- Entity creation triggers with binding (`when: mention: CommentMention.created`)
-- Black box functions (`parse_mentions()`, `users_with_usernames()`)
-- Explicit `let` binding for created entities
-- Set operations (`new_mentioned_users - old_mentions`)
-- Depth limiting (`thread_depth < 3`)
-- **Cross-pattern triggers**: Emits `UserMentioned` and `CommentReplied` triggers that Pattern 5 handles
-- Avoiding double notifications (`original_author not in comment.mentioned_users`)
-- Toggle pattern with conditional ensures
-- Join entity with three keys (`CommentReaction{comment, user, emoji}`)
-- Surface with role-conditional actions (author can edit, author or admin can delete)
 
 ---
 
 ## Pattern 8: Integrating Library Specs
 
-**Demonstrates:** External spec references with coordinates, configuration blocks, responding to external triggers, using external entities
+**Demonstrates:** external module composition for OAuth and billing workflows
 
-Library specs are standalone specifications for common functionality - authentication providers, payment processors, email services, etc. They define a contract that implementations must satisfy, and your application spec composes them in.
+### Example A: OAuth-backed app authentication
 
-### Example: OAuth Authentication
+```quint
+module AppAuth {
+  import OAuth.* from "oauth2"
 
-This example shows integrating a library OAuth spec into your application. The OAuth spec handles the authentication flow; your application responds to authentication events and manages application-level user state.
+  const USERS: Set[str]
 
-```
--- app-auth.allium
+  type UserStatus = | Active | Suspended | Deactivated
 
-------------------------------------------------------------
--- External Spec References
-------------------------------------------------------------
+  var status: str -> UserStatus
+  var lastLoginAt: str -> int
+  var linkedProviders: str -> Set[str]
 
--- Reference the OAuth spec from the library
--- The coordinate is immutable (git SHA), ensuring reproducible specs
-use "github.com/allium-specs/oauth2/af8e2c1d" as oauth
+  action init = all {
+    status' = USERS.mapBy(_ => Active),
+    lastLoginAt' = USERS.mapBy(_ => 0),
+    linkedProviders' = USERS.mapBy(_ => Set()),
+  }
 
--- Configure the OAuth spec for our application
-oauth/config {
-    providers: { google, microsoft, github }
-    session_duration: 24.hours
-    refresh_window: 1.hour
-    link_expiry: 15.minutes
-}
+  action createUserOnFirstLogin(user: str, provider: str, now: int) = all {
+    status.get(user) == Active,
+    linkedProviders' = linkedProviders.setBy(user, ps => ps.union(Set(provider))),
+    lastLoginAt' = lastLoginAt.set(user, now),
+    status' = status,
+  }
 
-------------------------------------------------------------
--- Application Entities
-------------------------------------------------------------
+  action updateUserOnLogin(user: str, now: int) = all {
+    status.get(user) == Active,
+    lastLoginAt' = lastLoginAt.set(user, now),
+    status' = status,
+    linkedProviders' = linkedProviders,
+  }
 
--- Our application's User entity, linked to OAuth identities
-entity User {
-    email: String
-    name: String
-    avatar_url: String?
-    status: active | suspended | deactivated
-    created_at: Timestamp
-    last_login_at: Timestamp?
+  action blockSuspendedUserLogin(user: str) = all {
+    status.get(user) == Suspended,
+    status' = status,
+    lastLoginAt' = lastLoginAt,
+    linkedProviders' = linkedProviders,
+  }
 
-    -- Relationship to OAuth sessions (from external spec)
-    sessions: oauth/Session with user = this
-    identities: oauth/Identity with user = this
+  action linkAdditionalProvider(user: str, provider: str) = all {
+    status.get(user) == Active,
+    not(linkedProviders.get(user).contains(provider)),
+    linkedProviders' = linkedProviders.setBy(user, ps => ps.union(Set(provider))),
+    status' = status,
+    lastLoginAt' = lastLoginAt,
+  }
 
-    -- Projections
-    active_sessions: sessions where status = active
-
-    -- Derived
-    is_authenticated: active_sessions.count > 0
-    linked_providers: identities -> provider
-}
-
--- Application-specific user preferences
-entity UserPreferences {
-    user: User
-    theme: light | dark | system
-    timezone: String
-    locale: String
-}
-
-------------------------------------------------------------
--- Responding to OAuth Events
-------------------------------------------------------------
-
--- When a user authenticates for the first time, create our User entity
-rule CreateUserOnFirstLogin {
-    when: oauth/AuthenticationSucceeded(identity, session)
-
-    requires: not exists User{email: identity.email}
-
-    ensures:
-        let user = User.created(
-            email: identity.email,
-            name: identity.display_name,
-            avatar_url: identity.avatar_url,
-            status: active,
-            created_at: now,
-            last_login_at: now
-        )
-        -- Link the OAuth identity to our user
-        identity.user = user
-        session.user = user
-        -- Create default preferences
-        UserPreferences.created(
-            user: user,
-            theme: system,
-            timezone: identity.timezone ?? "UTC",
-            locale: identity.locale ?? "en"
-        )
-        Email.created(
-            to: user.email,
-            template: welcome,
-            data: { user: user, provider: identity.provider }
-        )
-}
-
--- When an existing user logs in, update last login
-rule UpdateUserOnLogin {
-    when: oauth/AuthenticationSucceeded(identity, session)
-
-    let user = User{email: identity.email}
-
-    requires: exists user
-    requires: user.status = active
-
-    ensures: user.last_login_at = now
-    ensures: session.user = user
-}
-
--- Block login for suspended users
-rule BlockSuspendedUserLogin {
-    when: oauth/AuthenticationSucceeded(identity, session)
-
-    let user = User{email: identity.email}
-
-    requires: exists user
-    requires: user.status = suspended
-
-    ensures: session.status = revoked
-    ensures: UserInformed(
-        user: user,
-        about: account_suspended,
-        data: { contact: "support@example.com" }
-    )
-}
-
--- When OAuth session expires, we might want to notify
-rule NotifySessionExpiring {
-    when: session: oauth/Session.status transitions_to expiring
-
-    let user = session.user
-
-    requires: user != null
-
-    ensures: UserInformed(
-        user: user,
-        about: session_expiring,
-        data: { time_remaining: session.time_remaining }
-    )
-}
-
--- Audit logging for security events
-rule AuditLogout {
-    when: oauth/SessionTerminated(session, reason)
-
-    let user = session.user
-
-    requires: user != null
-
-    ensures: AuditLog.created(
-        user: user,
-        event: logout,
-        reason: reason,
-        timestamp: now,
-        metadata: { provider: session.provider, session_start: session.created_at }
-    )
-}
-
-------------------------------------------------------------
--- Application Actions Using OAuth
-------------------------------------------------------------
-
-rule LinkAdditionalProvider {
-    when: LinkProvider(user, provider)
-
-    requires: user.status = active
-    requires: provider not in user.linked_providers
-
-    -- Trigger the OAuth flow from the library spec
-    ensures: oauth/InitiateAuthentication(
-        provider: provider,
-        intent: link_account,
-        existing_user: user
-    )
-}
-
-rule UnlinkProvider {
-    when: UnlinkProvider(user, provider)
-
-    let identity = oauth/Identity{user, provider}
-
-    requires: user.status = active
-    requires: exists identity
-    requires: user.linked_providers.count > 1    -- must keep at least one
-
-    ensures: not exists identity
-    ensures: AuditLog.created(
-        user: user,
-        event: provider_unlinked,
-        timestamp: now,
-        metadata: { provider: provider }
-    )
+  action unlinkProvider(user: str, provider: str) = all {
+    status.get(user) == Active,
+    linkedProviders.get(user).size() > 1,
+    linkedProviders' = linkedProviders.setBy(user, ps => ps.exclude(provider)),
+    status' = status,
+    lastLoginAt' = lastLoginAt,
+  }
 }
 ```
 
-### Example: Payment Processing
+### Example B: Billing with imported payment module
 
-This example shows integrating a payment processor spec for subscription billing.
+```quint
+module Billing {
+  import StripeBilling.* from "stripe-billing"
 
-```
--- billing.allium
+  const ORGS: Set[str]
 
-------------------------------------------------------------
--- External Spec References
-------------------------------------------------------------
+  type SubscriptionStatus = | Trialing | Active | PastDue | Cancelled | Expired
+  type Plan = | Free | Pro | Enterprise
 
-use "github.com/allium-specs/stripe-billing/b2c4e6f8" as stripe
+  var subStatus: str -> SubscriptionStatus
+  var subPlan: str -> Plan
+  var trialReminderSent: str -> bool
 
-stripe/config {
-    currency: USD
-    tax_calculation: automatic
-    proration: create_prorations
-    trial_period: 14.days
-}
+  action init = all {
+    subStatus' = ORGS.mapBy(_ => Trialing),
+    subPlan' = ORGS.mapBy(_ => Free),
+    trialReminderSent' = ORGS.mapBy(_ => false),
+  }
 
-------------------------------------------------------------
--- Application Entities
-------------------------------------------------------------
+  action activateOnPaymentSuccess(org: str) = all {
+    Set(Trialing, PastDue).contains(subStatus.get(org)),
+    subStatus' = subStatus.set(org, Active),
+    subPlan' = subPlan,
+    trialReminderSent' = trialReminderSent,
+  }
 
-entity Organisation {
-    name: String
-    owner: User
-    billing_portal_url: String?
+  action handlePaymentFailure(org: str) = all {
+    subStatus' = subStatus.set(org, PastDue),
+    subPlan' = subPlan,
+    trialReminderSent' = trialReminderSent,
+  }
 
-    -- Link to Stripe customer (from external spec)
-    stripe_customer: stripe/Customer?
+  action trialEndingReminder(org: str) = all {
+    subStatus.get(org) == Trialing,
+    not(trialReminderSent.get(org)),
+    trialReminderSent' = trialReminderSent.set(org, true),
+    subStatus' = subStatus,
+    subPlan' = subPlan,
+  }
 
-    -- Relationships
-    subscription: Subscription with organisation = this
-    invoices: stripe/Invoice with stripe_customer = this
+  action handleSubscriptionCancelled(org: str) = all {
+    subStatus' = subStatus.set(org, Cancelled),
+    subPlan' = subPlan,
+    trialReminderSent' = trialReminderSent,
+  }
 
-    -- Derived
-    is_paying: subscription?.status = active
-    has_payment_method: stripe_customer?.default_payment_method != null
-}
+  action startSubscription(org: str, p: Plan) = all {
+    Set(Cancelled, Expired).contains(subStatus.get(org)),
+    subStatus' = subStatus.set(org, Trialing),
+    subPlan' = subPlan.set(org, p),
+    trialReminderSent' = trialReminderSent.set(org, false),
+  }
 
-entity Subscription {
-    organisation: Organisation
-    plan: Plan
-    status: trialing | active | past_due | cancelled | expired
-    started_at: Timestamp
-    trial_ends_at: Timestamp?
-    current_period_ends_at: Timestamp
-    trial_reminder_sent: Boolean
+  action changePlan(org: str, p: Plan) = all {
+    subStatus.get(org) == Active,
+    p != subPlan.get(org),
+    subPlan' = subPlan.set(org, p),
+    subStatus' = subStatus,
+    trialReminderSent' = trialReminderSent,
+  }
 
-    -- Link to Stripe subscription
-    stripe_subscription: stripe/Subscription?
-
-    -- Derived
-    is_trial: status = trialing
-    days_until_renewal: current_period_ends_at - now
-}
-
-------------------------------------------------------------
--- Responding to Payment Events
-------------------------------------------------------------
-
--- When Stripe confirms payment, activate or renew subscription
-rule ActivateOnPaymentSuccess {
-    when: stripe/PaymentSucceeded(invoice)
-
-    let customer = invoice.customer
-    let org = Organisation{stripe_customer: customer}
-    let sub = org.subscription
-
-    requires: exists org
-    requires: sub.status in {trialing, past_due}
-
-    ensures: sub.status = active
-    ensures: sub.current_period_ends_at = invoice.period_end
-    ensures: Email.created(
-        to: org.owner.email,
-        template: payment_confirmed,
-        data: { amount: invoice.amount, next_billing: invoice.period_end }
-    )
-}
-
--- Handle failed payments
-rule HandlePaymentFailure {
-    when: stripe/PaymentFailed(invoice, failure_reason)
-
-    let customer = invoice.customer
-    let org = Organisation{stripe_customer: customer}
-    let sub = org.subscription
-
-    requires: exists org
-
-    ensures: sub.status = past_due
-    ensures: Email.created(
-        to: org.owner.email,
-        template: payment_failed,
-        data: {
-            reason: failure_reason,
-            retry_date: invoice.next_payment_attempt,
-            update_payment_url: org.billing_portal_url
-        }
-    )
-    ensures: UserInformed(
-        user: org.owner,
-        about: payment_failed,
-        data: { reason: failure_reason }
-    )
-}
-
--- When trial is ending, remind user
-rule TrialEndingReminder {
-    when: sub: Subscription.trial_ends_at - 3.days <= now
-
-    requires: sub.status = trialing
-    requires: not sub.trial_reminder_sent
-
-    let org = sub.organisation
-
-    ensures: sub.trial_reminder_sent = true
-    ensures: Email.created(
-        to: org.owner.email,
-        template: trial_ending,
-        data: {
-            days_remaining: 3,
-            plan: sub.plan,
-            has_payment_method: org.has_payment_method
-        }
-    )
-}
-
--- Respond to subscription cancellation from Stripe
-rule HandleSubscriptionCancelled {
-    when: stripe/SubscriptionCancelled(stripe_sub, reason)
-
-    let sub = Subscription{stripe_subscription: stripe_sub}
-    let org = sub.organisation
-
-    requires: exists sub
-
-    ensures: sub.status = cancelled
-    ensures: Email.created(
-        to: org.owner.email,
-        template: subscription_cancelled,
-        data: { reason: reason, access_until: sub.current_period_ends_at }
-    )
-    ensures: AuditLog.created(
-        user: org.owner,
-        event: subscription_cancelled,
-        timestamp: now,
-        metadata: { reason: reason, plan: sub.plan.name }
-    )
-}
-
-------------------------------------------------------------
--- Application Actions Using Stripe
-------------------------------------------------------------
-
-rule StartSubscription {
-    when: StartSubscription(org, plan)
-
-    requires: org.subscription = null or org.subscription.status in {cancelled, expired}
-    requires: org.stripe_customer != null
-    requires: org.has_payment_method
-
-    ensures: stripe/CreateSubscription(
-        customer: org.stripe_customer,
-        price: plan.stripe_price_id,
-        trial_period: if plan.has_trial: stripe/config.trial_period else: null
-    )
-}
-
-rule ChangePlan {
-    when: ChangePlan(org, new_plan)
-
-    let sub = org.subscription
-
-    requires: sub.status = active
-    requires: new_plan != sub.plan
-
-    ensures: stripe/UpdateSubscription(
-        subscription: sub.stripe_subscription,
-        new_price: new_plan.stripe_price_id
-    )
-    ensures: sub.plan = new_plan
-}
-
-rule CancelSubscription {
-    when: CancelSubscription(org, reason)
-
-    let sub = org.subscription
-
-    requires: sub.status in {active, trialing}
-
-    ensures: stripe/CancelSubscription(
-        subscription: sub.stripe_subscription,
-        at_period_end: true    -- access continues until paid period ends
-    )
-    ensures: AuditLog.created(
-        user: org.owner,
-        event: cancellation_requested,
-        timestamp: now,
-        metadata: { reason: reason }
-    )
+  action cancelSubscription(org: str) = all {
+    Set(Active, Trialing).contains(subStatus.get(org)),
+    subStatus' = subStatus.set(org, Cancelled),
+    subPlan' = subPlan,
+    trialReminderSent' = trialReminderSent,
+  }
 }
 ```
 
-**Key language features shown:**
-- External spec references with immutable coordinates (`use "github.com/.../abc123" as alias`)
-- Configuration blocks for external specs (`oauth/config { ... }`)
-- Responding to external triggers (`when: oauth/AuthenticationSucceeded(...)`)
-- Trigger emissions for cross-pattern notification (`UserInformed(...)`)
-- Responding to external state transitions (`when: session: oauth/Session.status transitions_to expiring`)
-- Using external entities (`oauth/Session`, `stripe/Customer`)
-- Linking application entities to external entities (`stripe_customer: stripe/Customer?`)
-- Triggering external actions (`ensures: stripe/CreateSubscription(...)`)
-- Qualified names throughout (`oauth/Session`, `stripe/config.trial_period`)
+## Using these patterns
 
-### Library Spec Design Principles
+1. Start with the nearest pattern and rename entities to your domain.
+2. Keep finite sets and bounded counters while shaping behaviour.
+3. Add invariants first, then temporal properties.
+4. Compose patterns by importing modules and sharing keys (user, workspace, resource IDs).
 
-When creating or choosing library specs:
+## Additional parity snippets
 
-1. **Immutable coordinates**: Always use content-addressed references (git SHAs), never floating versions
-2. **Configuration over convention**: Library specs should expose configuration for anything that might vary between applications
-3. **Observable triggers**: Library specs should emit triggers for all significant events so consuming specs can respond
-4. **Minimal coupling**: Library specs shouldn't depend on your application entities - the linkage goes one way
-5. **Clear boundaries**: The library spec handles its domain (OAuth flow, payment processing); your spec handles application concerns (user creation, access control)
+These snippets keep extra functional examples that were present in the earlier catalog.
 
----
+### Password auth: locked-attempt and session-expiry paths
 
-## Using These Patterns
-
-### Composition
-
-Patterns can be composed. For example, a complete document collaboration spec might use:
-
-```
-use "./rbac.allium" as rbac
-use "./soft-delete.allium" as trash
-use "./comments.allium" as comments
-use "./notifications.allium" as notify
-
-entity Document {
-    workspace: Workspace
-    title: String
-    content: String
-    status: active | deleted
-    deleted_at: Timestamp?
-    deleted_by: User?
-
-    -- From comments pattern
-    comments: comments/Comment with document = this
-
-    -- From soft-delete pattern
-    retention_expires_at: deleted_at + trash/config.retention_period
-    can_restore: status = deleted and retention_expires_at > now
-    ...
+```quint
+action loginAttemptWhileLocked(user: str, now: int) = all {
+  status.get(user) == Locked,
+  lockedUntil.get(user) > now,
+  // user informed; state unchanged in core auth maps
+  status' = status,
+  failedAttempts' = failedAttempts,
+  lockedUntil' = lockedUntil,
+  activeSessions' = activeSessions,
+  resetTokenStatus' = resetTokenStatus,
+  resetTokenExpiresAt' = resetTokenExpiresAt,
 }
 
--- Document actions require RBAC checks
-rule EditDocument {
-    when: EditDocument(user, document, content)
-
-    let share = rbac/ResourceShare{resource: document, user: user}
-
-    requires: share.can_edit
-    ...
+action sessionExpires(user: str) = all {
+  activeSessions.get(user) > 0,
+  activeSessions' = activeSessions.setBy(user, n => n - 1),
+  status' = status,
+  failedAttempts' = failedAttempts,
+  lockedUntil' = lockedUntil,
+  resetTokenStatus' = resetTokenStatus,
+  resetTokenExpiresAt' = resetTokenExpiresAt,
 }
 ```
 
-### Adaptation
+### RBAC: permission maintenance and self-leave flow
 
-Patterns are starting points. When applying:
+```quint
+action leaveWorkspace(user: str, workspace: str) = all {
+  membershipRole.get((workspace, user)) != Viewer,
+  membershipRole' = membershipRole.set((workspace, user), Viewer),
+  documentsPerWorkspace' = documentsPerWorkspace,
+}
 
-1. **Rename** to match your domain (User → Member, Document → Note)
-2. **Adjust** timeouts and limits to your context
-3. **Remove** unused states or rules
-4. **Extend** with domain-specific behaviour
-5. **Compose** multiple patterns for richer functionality
+action grantEditorFromViewer(actor: str, workspace: str, user: str) = all {
+  canAdmin(actor, workspace),
+  membershipRole.get((workspace, user)) == Viewer,
+  membershipRole' = membershipRole.set((workspace, user), Editor),
+  documentsPerWorkspace' = documentsPerWorkspace,
+}
+```
 
-### Anti-Patterns
+### Resource invitation: new-user acceptance and invitation revocation
 
-When using patterns, avoid:
+```quint
+var users: Set[str]
 
-- **Over-engineering**: Don't include reaction system if you don't need reactions
-- **Premature abstraction**: Start concrete, extract patterns when you see repetition
-- **Pattern worship**: If the pattern doesn't fit, adapt it or write something custom
-- **Ignoring context**: A free tier pattern that makes sense for B2C may not fit B2B
+action acceptInvitationNewUser(invId: int, newUser: str) = all {
+  invites.get(invId).status == Pending,
+  not(users.contains(newUser)),
+  users' = users.union(Set(newUser)),
+  invites' = invites.setBy(invId, i => {
+    resource: i.resource, email: i.email, permission: i.permission,
+    invitedBy: i.invitedBy, expiresAt: i.expiresAt, status: Accepted
+  }),
+  shareActive' = shareActive.set((invites.get(invId).resource, newUser), true),
+  sharePermission' = sharePermission.set((invites.get(invId).resource, newUser), invites.get(invId).permission),
+}
+```
+
+### Soft delete: empty trash and restore-all operations
+
+```quint
+action emptyTrash(now: int) = all {
+  status' = DOCUMENTS.mapBy(doc =>
+    if (status.get(doc) == Deleted and deletedAt.get(doc) + RETENTION_PERIOD <= now)
+      Purged
+      else status.get(doc)),
+  deletedAt' = deletedAt,
+  deletedBy' = deletedBy,
+}
+
+action restoreAll(now: int) = all {
+  status' = DOCUMENTS.mapBy(doc =>
+    if (status.get(doc) == Deleted and deletedAt.get(doc) + RETENTION_PERIOD > now)
+      Active
+      else status.get(doc)),
+  deletedAt' = DOCUMENTS.mapBy(doc =>
+    if (status.get(doc) == Deleted and deletedAt.get(doc) + RETENTION_PERIOD > now)
+      0
+      else deletedAt.get(doc)),
+  deletedBy' = deletedBy,
+}
+```
+
+### Notifications: archive and mark-all-read
+
+```quint
+action archiveNotification(id: int) = all {
+  used.contains(id),
+  notification' = notification.setBy(id, n => {
+    user: n.user, kind: n.kind, status: Archived, emailStatus: n.emailStatus, createdAt: n.createdAt
+  }),
+  used' = used,
+}
+
+action markAllRead(user: str) = all {
+  notification' = NOTIFICATIONS.mapBy(id =>
+    if (used.contains(id) and notification.get(id).user == user and notification.get(id).status == Unread)
+      {
+        user: notification.get(id).user,
+        kind: notification.get(id).kind,
+        status: Read,
+        emailStatus: notification.get(id).emailStatus,
+        createdAt: notification.get(id).createdAt
+      }
+      else notification.get(id)),
+  used' = used,
+}
+```
+
+### Usage limits: downgrade blocking semantics
+
+```quint
+action downgradeBlocked(workspace: str, newPlan: Plan) = all {
+  documents.get(workspace) > maxDocuments(newPlan)
+    or members.get(workspace) > maxMembers(newPlan)
+    or apiRequestsToday.get(workspace) > maxApiRequests(newPlan),
+  // explicitly blocked: state unchanged
+  plan' = plan,
+  documents' = documents,
+  members' = members,
+  storageBytes' = storageBytes,
+  apiRequestsToday' = apiRequestsToday,
+  nextResetAt' = nextResetAt,
+}
+```
+
+### Comments: explicit remove-reaction variant
+
+```quint
+action removeReaction(c: int, u: str, emoji: str) = all {
+  reactions.contains((c, u, emoji)),
+  reactions' = reactions.exclude((c, u, emoji)),
+  status' = status,
+  author' = author,
+  replyTo' = replyTo,
+  mentionsByComment' = mentionsByComment,
+  mentionEvents' = mentionEvents,
+  replyEvents' = replyEvents,
+}
+```
+
+### Integration modules: suspend-login policy remains explicit
+
+```quint
+action blockSuspendedUserLogin(user: str) = all {
+  status.get(user) == Suspended,
+  // state unchanged: login is denied by guard
+  status' = status,
+  lastLoginAt' = lastLoginAt,
+  linkedProviders' = linkedProviders,
+}
+```

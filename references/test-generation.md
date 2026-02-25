@@ -1,49 +1,148 @@
 # Test generation
 
-From an Allium specification, generate:
+From a Quint specification, generate the same functional test categories as the previous workflow, with explicit support for the core scenario set.
 
-**Contract tests** (per rule):
-- Success case: all preconditions met, verify all postconditions hold
-- Failure cases: one test per precondition, verify rule is rejected when that precondition fails
-- Edge cases: boundary values for numeric conditions
+## 1. Contract tests (per action)
 
-**State transition tests** (per entity with status):
-- Valid transitions succeed via their rules
-- Invalid transitions are rejected (no rule allows them)
-- Terminal states have no outbound transitions
+For every action:
 
-**Temporal tests** (per time-based trigger):
-- Before deadline: rule doesn't fire, state unchanged
-- At deadline: rule fires, postconditions hold
-- After deadline: rule has already fired, doesn't re-fire
+1. Enabled case: guards hold, expected next-state predicates hold.
+2. Disabled cases: falsify one guard at a time and confirm action is not enabled.
+3. Boundary cases: threshold edges (equal, just below, just above).
 
-**Communication tests** (per Notification/Email/etc):
-- Verify communication is triggered
-- Verify recipient is correct
-- Verify template and data are passed
+Template checklist:
 
-**Scenario tests** (per flow):
-- Happy path through main flow
-- Edge cases and error paths
-- Concurrent scenarios: what happens if two triggers fire simultaneously?
+- guard coverage complete
+- all updated vars asserted
+- unchanged vars asserted where relevant
 
-**Sum type tests** (per sum type):
-- Type discrimination: verify each variant has distinct accessible fields
-- Exhaustiveness: verify all variants are handled in conditional logic
-- Invalid state prevention: verify that an entity cannot be multiple variants
-- Type guard correctness: verify variant-specific fields are only accessible within appropriate type guards
+## 2. Lifecycle transition tests (per status model)
 
-**Surface tests** (per surface):
-- Exposure tests: verify each item in `exposes` is accessible to the specified party
-- Provides availability tests: verify provided operations appear when their `when` conditions are true
-- Provides unavailability tests: verify provided operations are hidden when `when` conditions are false
-- Requires tests: verify the surface rejects interaction when required contributions are missing
-- Related surface navigation: verify navigation to related surfaces works
-- Party restriction tests: verify the surface is not accessible to other party types
-- Guarantee tests: verify stated guarantees hold across the boundary
+For each lifecycle map:
 
-**Cross-rule interaction tests** (per rule with entity-creating ensures):
-- Re-trigger sibling rules on the same parent while the created entity exists. Verify guards prevent duplicate creation or conflicting state.
-- For each surface `provides` entry, generate unavailability tests for each conjunct in the corresponding rule's requires. One test per conjunct, each falsifying that conjunct, verifying the operation is hidden or rejected.
+- allowed transitions are reachable
+- forbidden transitions are unreachable
+- terminal states remain terminal unless explicit recovery action exists
 
-**Concurrency note:** Rules are assumed to be atomic, meaning a rule either completes entirely or not at all. If two rules could fire simultaneously on the same entity, test that the resulting state is consistent regardless of order.
+Use coverage matrix:
+
+| Entity lifecycle | Expected transitions | Forbidden transitions |
+|------------------|----------------------|-----------------------|
+| InviteStatus | Pending->Accepted/Declined/Expired/Revoked | Accepted->Pending |
+| UserStatus | Active->Locked, Locked->Active | Deactivated->Active (if not supported) |
+| SubscriptionStatus | Trialing->Active/PastDue, Active->Cancelled | Cancelled->Active (if forbidden) |
+
+## 3. Temporal tests (per time-guarded action)
+
+For each temporal guard `deadline <= now`:
+
+- before deadline: disabled
+- at deadline: enabled and correct transition
+- after deadline: repeated runs preserve invariants (idempotent or terminal)
+
+Targets include:
+
+- lockout expiry
+- invitation expiry
+- reset token expiry
+- daily quota reset
+- retention purge
+- trial reminder windows
+
+## 4. Communication/event tests
+
+When model includes event sets/outboxes:
+
+- verify recipient/target identity
+- verify event type/variant
+- verify event suppression rules (no duplicate mention + reply)
+
+## 5. Scenario tests (end-to-end runs)
+
+Per feature area add at least:
+
+1. happy-path run
+2. blocked-path run
+3. timeout/expiry run
+
+Recommended scenario families:
+
+- password lockout then reset
+- invitation create -> accept -> share activation
+- invitation create -> expire
+- usage within limits then blocked at limit
+- soft delete -> restore within retention
+- soft delete -> purge after retention
+- comment reply with mention suppression behavior
+- payment failure then recovery
+
+## 6. Variant and match tests
+
+For sum types and pattern matches:
+
+- each constructor appears in at least one run
+- match expressions are branch-complete for used variants
+- variant-specific fields are accessed only in valid branch contexts
+
+## 7. Cross-action interaction tests
+
+Generate interleavings for actions touching same state.
+
+Examples:
+
+- `loginFailure` vs `lockoutExpires`
+- `acceptInvitation` vs `invitationExpires`
+- `downgradePlan` vs `createDocument`
+- `createReply` vs `deleteComment`
+
+Assertions:
+
+- invariants always hold
+- no impossible state combinations emerge
+
+## 8. Property-focused verification plan
+
+For each critical invariant:
+
+1. quick simulation pass (`run`)
+2. bounded verify pass (`verify`)
+3. backend comparison for high-risk models (Apalache and TLC when needed)
+
+## Command templates
+
+```bash
+# Parse and typecheck
+quint parse model.qnt
+quint typecheck model.qnt
+
+# Fast simulation-based invariant checks
+quint run model.qnt --invariants attemptsNonNegative sessionsNonNegative --max-steps=60
+
+# Model-based trace generation for implementation replay
+quint run model.qnt --mbt --out-itf=traces/trace_{seq}.itf.json --n-traces=200 --max-steps=50
+
+# Bounded verification of critical invariants
+quint verify model.qnt --invariant attemptsNonNegative --max-steps=30
+quint verify model.qnt --invariant inviteLifecycleValid --max-steps=30
+
+# Alternate backend cross-check where required
+quint verify model.qnt --backend=tlc --invariant attemptsNonNegative
+```
+
+## Minimal CI test policy
+
+Per module in CI:
+
+1. `parse` + `typecheck`
+2. one fast `run` invariant suite
+3. one `verify` invariant suite
+4. optional MBT trace export for downstream tests
+
+## Failure triage guide
+
+When a check fails:
+
+1. classify: model bug vs assumption gap vs intended behavior not yet modeled
+2. isolate smallest failing run
+3. add regression `run` scenario reproducing failure
+4. update action guards/state updates or invariant definition
